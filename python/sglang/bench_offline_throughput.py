@@ -11,17 +11,20 @@ python -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1
 """
 
 import argparse
+import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import os
 import random
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 
 from sglang.bench_serving import (
+    DatasetRow,
     get_dataset,
     get_tokenizer,
     sample_random_requests,
@@ -56,6 +59,7 @@ class BenchArgs:
     profile: bool = False
     skip_warmup: bool = False
     do_not_exit: bool = False
+    prompt_suffix: str = ""
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -177,6 +181,12 @@ class BenchArgs:
             action="store_true",
             help="Do not exit the program. This is useful for nsys profile with --duration and --delay.",
         )
+        parser.add_argument(
+            "--prompt-suffix",
+            type=str,
+            default="",
+            help="Suffix applied to the end of all user prompts, followed by assistant prompt suffix.",
+        )
 
     @classmethod
     def from_cli_args(cls, args: argparse.Namespace):
@@ -187,7 +197,7 @@ class BenchArgs:
 def throughput_test_once(
     backend_name: str,
     backend,
-    reqs: List[Tuple[str, int, int]],
+    reqs: List[DatasetRow],
     ignore_eos: bool,
     extra_request_body: Dict,
     profile: bool,
@@ -196,7 +206,7 @@ def throughput_test_once(
         "backend": backend_name,
         "successful_requests": len(reqs),
         "total_latency": -1,
-        "total_input_tokens": sum(r[1] for r in reqs),
+        "total_input_tokens": sum(r.prompt_len for r in reqs),
         "total_output_tokens": -1,
         "request_throughput": -1,
         "input_throughput": -1,
@@ -204,11 +214,11 @@ def throughput_test_once(
         "total_throughput": -1,
     }
 
-    prompt = [r[0] for r in reqs]
+    prompt = [r.prompt for r in reqs]
     sampling_params = [
         {
             "temperature": 0,
-            "max_new_tokens": r[2],
+            "max_new_tokens": r.output_len,
             "ignore_eos": ignore_eos,
             **extra_request_body,
         }
@@ -216,6 +226,10 @@ def throughput_test_once(
     ]
 
     if profile:
+        assert (
+            "SGLANG_TORCH_PROFILER_DIR" in os.environ
+        ), "Please set SGLANG_TORCH_PROFILER_DIR."
+        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
         backend.start_profile()
 
     st = time.perf_counter()
@@ -223,11 +237,15 @@ def throughput_test_once(
     latency = time.perf_counter() - st
 
     if profile:
+        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        known_files = set(os.listdir(dir))
         backend.stop_profile()
-        monitor_trace_file(os.getenv("SGLANG_TORCH_PROFILER_DIR"))
+        monitor_trace_file(known_files, dir)
 
     if backend_name == "runtime":
         gen_out = json.loads(gen_out)
+
+    server_info = backend.get_server_info()
 
     measurement_results["total_latency"] = latency
     measurement_results["total_output_tokens"] = sum(
@@ -247,14 +265,18 @@ def throughput_test_once(
         + measurement_results["total_output_tokens"]
     ) / latency
 
+    if inspect.isawaitable(server_info):
+        server_info = asyncio.run(server_info)
+
+    measurement_results["last_gen_throughput"] = server_info["internal_states"][0][
+        "last_gen_throughput"
+    ]
+
     return measurement_results
 
 
-def monitor_trace_file(directory, interval=1):
-
+def monitor_trace_file(known_files, directory, interval=1):
     print(f"Monitoring {directory} for new trace files...")
-
-    known_files = set(os.listdir(directory))
 
     while True:
         flag = False
@@ -301,7 +323,7 @@ def throughput_test(
     tokenizer_id = server_args.tokenizer_path or server_args.model_path
     tokenizer = get_tokenizer(tokenizer_id)
 
-    # Set global environmnets
+    # Set global environments
     set_ulimit()
     random.seed(bench_args.seed)
     np.random.seed(bench_args.seed)
@@ -360,6 +382,11 @@ def throughput_test(
     print("{:<40} {:<10}".format("Total input tokens:", result["total_input_tokens"]))
     print(
         "{:<40} {:<10}".format("Total generated tokens:", result["total_output_tokens"])
+    )
+    print(
+        "{:<40} {:<10.2f}".format(
+            "Last generation throughput (tok/s):", result["last_gen_throughput"]
+        )
     )
     print(
         "{:<40} {:<10.2f}".format(

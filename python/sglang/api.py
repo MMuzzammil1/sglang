@@ -15,6 +15,7 @@ from sglang.lang.ir import (
     SglRoleBegin,
     SglRoleEnd,
     SglSelect,
+    SglSeparateReasoning,
     SglVideo,
 )
 
@@ -75,6 +76,7 @@ def gen(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
     min_tokens: Optional[int] = None,
+    n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -94,7 +96,7 @@ def gen(
     regex: Optional[str] = None,
     json_schema: Optional[str] = None,
 ):
-    """Call the model to generate. See the meaning of the arguments in docs/sampling_params.md"""
+    """Call the model to generate. See the meaning of the arguments in docs/backend/sampling_params.md"""
 
     if choices:
         return SglSelect(
@@ -115,6 +117,7 @@ def gen(
         name,
         max_tokens,
         min_tokens,
+        n,
         stop,
         stop_token_ids,
         temperature,
@@ -137,6 +140,7 @@ def gen(
 def gen_int(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -155,6 +159,7 @@ def gen_int(
         name,
         max_tokens,
         None,
+        n,
         stop,
         stop_token_ids,
         temperature,
@@ -176,6 +181,7 @@ def gen_int(
 def gen_string(
     name: Optional[str] = None,
     max_tokens: Optional[int] = None,
+    n: Optional[int] = None,
     stop: Optional[Union[str, List[str]]] = None,
     stop_token_ids: Optional[List[int]] = None,
     temperature: Optional[float] = None,
@@ -194,6 +200,7 @@ def gen_string(
         name,
         max_tokens,
         None,
+        n,
         stop,
         stop_token_ids,
         temperature,
@@ -271,3 +278,9 @@ def assistant_begin():
 
 def assistant_end():
     return SglRoleEnd("assistant")
+
+
+def separate_reasoning(
+    expr: Optional[SglExpr] = None, model_type: Optional[str] = None
+):
+    return SglExprList([expr, SglSeparateReasoning(model_type, expr=expr)])

@@ -18,6 +18,7 @@
 # LoRA layers class inheritance adapted from:
 # https://github.com/vllm-project/vllm/blob/4abf6336ec65c270343eb895e7b18786e9274176/vllm/lora/layers.py
 
+import logging
 import re
 from typing import Dict, List
 
@@ -26,9 +27,11 @@ from torch import nn
 
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.hf_transformers_utils import AutoConfig
-from sglang.srt.lora.backend import BaseLoRABackend
+from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.model_loader.loader import DefaultModelLoader
+
+logger = logging.getLogger(__name__)
 
 
 class LoRALayer(nn.Module):
@@ -36,16 +39,9 @@ class LoRALayer(nn.Module):
         super().__init__()
         self.config: LoRAConfig = config
         self.base_hf_config: AutoConfig = base_hf_config
+
+        # lora weights in cpu. The weights are loaded from checkpoint.
         self.weights: Dict[str, torch.Tensor] = {}
-        self.weight_gpu: Dict[str, torch.Tensor] = {}
-
-    def load_to_gpu(self):
-        for name, weight in self.weights.items():
-            self.weight_gpu[name] = weight.to(torch.float16).to("cuda")
-
-    def offload_from_gpu(self):
-        for name, weight in self.weights.items():
-            self.weight_gpu[name] = None
 
 
 class LoRAAdapter(nn.Module):
@@ -69,24 +65,11 @@ class LoRAAdapter(nn.Module):
         self.layers: List[LoRALayer] = nn.ModuleList(
             [
                 LoRALayer(config, base_hf_config)
-                for i in range(base_hf_config.num_hidden_layers)
+                for _ in range(base_hf_config.num_hidden_layers)
             ]
         )
 
         self.weights: Dict[str, torch.Tensor] = {}
-        self.weights_gpu: Dict[str, torch.Tensor] = {}
-
-    def load_to_gpu(self):
-        for name, weight in self.weights.items():
-            self.weights_gpu[name] = weight.to(torch.float16).to("cuda")
-        for layer in self.layers:
-            layer.load_to_gpu()
-
-    def offload_from_gpu(self):
-        for name, weight in self.weights.items():
-            self.weights_gpu[name] = None
-        for layer in self.layers:
-            layer.offload_from_gpu()
 
     # initialize the LoRA weights to cpu
     def initialize_weights(self):
@@ -105,15 +88,15 @@ class LoRAAdapter(nn.Module):
             else:
                 self.weights[name] = loaded_weight.cpu()
 
-        # stack kv_proj and gate_up_proj
-        for i in range(self.base_hf_config.num_hidden_layers):
-            layer = self.layers[i]
-            weight_names = [name for name, _ in layer.weights.items()]
-            self.stack_qkv_proj(weight_names, layer.weights)
-            self.stack_gate_up_proj(weight_names, layer.weights)
+        # normalize kv_proj and gate_up_proj
+        for layer in self.layers:
+            weight_names = list(layer.weights.keys())
+            self.normalize_qkv_proj(weight_names, layer.weights)
+            self.normalize_gate_up_proj(weight_names, layer.weights)
 
-    def stack_qkv_proj(self, weight_names: List[str], weights: Dict[str, torch.Tensor]):
-
+    def normalize_qkv_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
         # Collect target q/k/v modules. This process is necessary since there might be no lora attached to k_proj
         target_module = set()
         for weight_name in weight_names:
@@ -123,6 +106,8 @@ class LoRAAdapter(nn.Module):
                 target_module.add("q_proj")
             if "v_proj" in weight_name:
                 target_module.add("v_proj")
+            if "qkv_proj" in weight_name:
+                target_module.add("qkv_proj")
         if len(target_module) == 0:
             return
 
@@ -165,14 +150,49 @@ class LoRAAdapter(nn.Module):
                     if "k_proj" in target_module:
                         weights.pop(k_name)
                     weights.pop(v_name)
+            elif "qkv_proj" in weight_name:
+                # If qkv_proj is already stacked, we normalize it following the SGL convention.
+                qkv_name = weight_name
+                q_name = weight_name.replace("qkv_proj", "q_proj")
+                k_name = weight_name.replace("qkv_proj", "k_proj")
+                v_name = weight_name.replace("qkv_proj", "v_proj")
+                kv_name = weight_name.replace("qkv_proj", "kv_proj")
+                if "lora_A" in weight_name:
+                    weights[qkv_name] = weights[qkv_name].repeat(3, 1)
+                else:
+                    head_size = (
+                        self.base_hf_config.hidden_size
+                        // self.base_hf_config.num_attention_heads
+                    )
+                    weights[q_name], k_proj_weight, v_proj_weight = torch.split(
+                        weights[qkv_name],
+                        [
+                            head_size * self.base_hf_config.num_attention_heads,
+                            head_size * self.base_hf_config.num_key_value_heads,
+                            head_size * self.base_hf_config.num_key_value_heads,
+                        ],
+                        dim=0,
+                    )
+                    weights[kv_name] = torch.stack(
+                        [k_proj_weight, v_proj_weight],
+                        dim=0,
+                    )
 
-    def stack_gate_up_proj(
+    def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
         for weight_name in weight_names:
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
                 gate_up_name = weight_name.replace("gate_proj", "gate_up_proj")
+                if up_name not in weights:
+                    weights[up_name] = torch.zeros_like(weights[weight_name])
+                    # FIXME: Add gate-only support for flashinfer in future implementations
+                    assert self.lora_backend.name == "triton", (
+                        f"LoRA weight initialization currently only supported for 'triton' backend. "
+                        f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
+                        f"or consider implementing custom initialization logic for other backends."
+                    )
                 if "lora_A" in weight_name:
                     weights[gate_up_name] = torch.cat(
                         (weights[weight_name], weights[up_name]), 0
@@ -182,4 +202,19 @@ class LoRAAdapter(nn.Module):
                         [weights[weight_name], weights[up_name]], dim=0
                     )
                 weights.pop(weight_name)
-                weights.pop(up_name)
+                if up_name in weights:
+                    weights.pop(up_name)
+            elif "gate_up_proj" in weight_name:
+                # If gate_up_proj is already stacked, we normalize it following the SGL convention
+                gate_up_name = weight_name
+                if "lora_A" in weight_name:
+                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                else:
+                    output_dim = weights[gate_up_name].shape[0] // 2
+                    weights[gate_up_name] = torch.stack(
+                        [
+                            weights[gate_up_name][:output_dim, :],
+                            weights[gate_up_name][output_dim:, :],
+                        ],
+                        dim=0,
+                    )

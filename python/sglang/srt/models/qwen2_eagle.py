@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.utils import add_prefix
+
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
@@ -22,13 +24,14 @@ from typing import Iterable, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.qwen2 import Qwen2DecoderLayer, Qwen2ForCausalLM
 
 Qwen2Config = None
@@ -42,7 +45,7 @@ class Qwen2DecoderLayer(Qwen2DecoderLayer):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config, layer_id, quant_config)
+        super().__init__(config, layer_id, quant_config, prefix=prefix)
 
         # Skip the input_layernorm
         # https://github.com/SafeAILab/EAGLE/blob/35c78f6cdc19a73e05cf5c330b4c358dad970c6a/eagle/model/cnets.py#L427
@@ -56,6 +59,7 @@ class Qwen2Model(nn.Module):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -63,11 +67,15 @@ class Qwen2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
                 Qwen2DecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -80,6 +88,7 @@ class Qwen2Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -107,17 +116,23 @@ class Qwen2ForCausalLMEagle(Qwen2ForCausalLM):
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.model = Qwen2Model(config, quant_config=quant_config)
+        self.pp_group = get_pp_group()
+        self.model = Qwen2Model(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
         self.logits_processor = LogitsProcessor(config)
 

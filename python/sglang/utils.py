@@ -1,27 +1,80 @@
 """Common utilities"""
 
-import base64
 import importlib
 import json
 import logging
 import os
+import random
 import signal
+import socket
 import subprocess
 import sys
 import time
 import traceback
 import urllib.request
+import weakref
 from concurrent.futures import ThreadPoolExecutor
+from functools import wraps
 from io import BytesIO
 from json import dumps
 from typing import Any, Callable, List, Optional, Tuple, Type, Union
 
 import numpy as np
+import pybase64
 import requests
 from IPython.display import HTML, display
+from pydantic import BaseModel
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
+
+
+def execute_once(func):
+    has_run = None
+
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        nonlocal has_run
+        if not has_run:
+            func(*args, **kwargs)
+            has_run = True
+
+    return wrapper
+
+
+@execute_once
+def info_once(message: str):
+    logger.info(message)
+
+
+def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
+    """Convert a JSON schema to a string.
+    Parameters
+    ----------
+    json_schema
+        The JSON schema.
+    Returns
+    -------
+    str
+        The JSON schema converted to a string.
+    Raises
+    ------
+    ValueError
+        If the schema is not a dictionary, a string or a Pydantic class.
+    """
+    if isinstance(json_schema, dict):
+        schema_str = json.dumps(json_schema)
+    elif isinstance(json_schema, str):
+        schema_str = json_schema
+    elif issubclass(json_schema, BaseModel):
+        schema_str = json.dumps(json_schema.model_json_schema())
+    else:
+        raise ValueError(
+            f"Cannot parse schema {json_schema}. The schema must be either "
+            + "a Pydantic class, a dictionary or a string that contains the JSON "
+            + "schema specification"
+        )
+    return schema_str
 
 
 def get_exception_traceback():
@@ -114,15 +167,15 @@ def encode_image_base64(image_path: Union[str, bytes]):
     if isinstance(image_path, str):
         with open(image_path, "rb") as image_file:
             data = image_file.read()
-            return base64.b64encode(data).decode("utf-8")
+            return pybase64.b64encode(data).decode("utf-8")
     elif isinstance(image_path, bytes):
-        return base64.b64encode(image_path).decode("utf-8")
+        return pybase64.b64encode(image_path).decode("utf-8")
     else:
         # image_path is PIL.WebPImagePlugin.WebPImageFile
         image = image_path
         buffered = BytesIO()
         image.save(buffered, format="PNG")
-        return base64.b64encode(buffered.getvalue()).decode("utf-8")
+        return pybase64.b64encode(buffered.getvalue()).decode("utf-8")
 
 
 def encode_frame(frame):
@@ -189,7 +242,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     video_bytes = b"".join(encoded_frames)
 
     # Encode the concatenated bytes to base64
-    video_base64 = "video:" + base64.b64encode(video_bytes).decode("utf-8")
+    video_base64 = "video:" + pybase64.b64encode(video_bytes).decode("utf-8")
 
     return video_base64
 
@@ -236,17 +289,6 @@ def find_printable_text(text: str):
     # which may change with the subsequent token -- there are probably smarter ways to do this!)
     else:
         return text[: text.rfind(" ") + 1]
-
-
-def graceful_registry(sub_module_name: str):
-    def graceful_shutdown(signum, frame):
-        logger.info(
-            f"{sub_module_name} Received signal to shutdown. Performing graceful shutdown..."
-        )
-        if signum == signal.SIGTERM:
-            logger.info(f"{sub_module_name} recive sigterm")
-
-    signal.signal(signal.SIGTERM, graceful_shutdown)
 
 
 class LazyImport:
@@ -306,20 +348,93 @@ def download_and_cache_file(url: str, filename: Optional[str] = None):
     return filename
 
 
+def is_in_ci():
+    from sglang.test.test_utils import is_in_ci
+
+    return is_in_ci()
+
+
+def print_highlight(html_content: str):
+    if is_in_ci():
+        html_content = str(html_content).replace("\n", "<br>")
+        display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
+    else:
+        print(html_content)
+
+
+process_socket_map = weakref.WeakKeyDictionary()
+
+
+def reserve_port(host, start=30000, end=40000):
+    """
+    Reserve an available port by trying to bind a socket.
+    Returns a tuple (port, lock_socket) where `lock_socket` is kept open to hold the lock.
+    """
+    candidates = list(range(start, end))
+    random.shuffle(candidates)
+
+    for port in candidates:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            # Attempt to bind to the port on localhost
+            sock.bind((host, port))
+            return port, sock
+        except socket.error:
+            sock.close()  # Failed to bind, try next port
+            continue
+    raise RuntimeError("No free port available.")
+
+
+def release_port(lock_socket):
+    """
+    Release the reserved port by closing the lock socket.
+    """
+    try:
+        lock_socket.close()
+    except Exception as e:
+        print(f"Error closing socket: {e}")
+
+
 def execute_shell_command(command: str) -> subprocess.Popen:
     """
-    Execute a shell command and return the process handle
-
-    Args:
-        command: Shell command as a string (can include \\ line continuations)
-    Returns:
-        subprocess.Popen: Process handle
+    Execute a shell command and return its process handle.
     """
-    # Replace \ newline with space and split
     command = command.replace("\\\n", " ").replace("\\", " ")
     parts = command.split()
-
     return subprocess.Popen(parts, text=True, stderr=subprocess.STDOUT)
+
+
+def launch_server_cmd(command: str, host: str = "0.0.0.0", port: int = None):
+    """
+    Launch the server using the given command.
+    If no port is specified, a free port is reserved.
+    """
+    if port is None:
+        port, lock_socket = reserve_port(host)
+    else:
+        lock_socket = None
+
+    full_command = f"{command} --port {port}"
+    process = execute_shell_command(full_command)
+
+    if lock_socket is not None:
+        process_socket_map[process] = lock_socket
+
+    return process, port
+
+
+def terminate_process(process):
+    """
+    Terminate the process and automatically release the reserved port.
+    """
+    from sglang.srt.utils import kill_process_tree
+
+    kill_process_tree(process.pid)
+
+    lock_socket = process_socket_map.pop(process, None)
+    if lock_socket is not None:
+        release_port(lock_socket)
 
 
 def wait_for_server(base_url: str, timeout: int = None) -> None:
@@ -329,7 +444,7 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
         base_url: The base URL of the server
         timeout: Maximum time to wait in seconds. None means wait forever.
     """
-    start_time = time.time()
+    start_time = time.perf_counter()
     while True:
         try:
             response = requests.get(
@@ -343,25 +458,15 @@ def wait_for_server(base_url: str, timeout: int = None) -> None:
                     NOTE: Typically, the server runs in a separate terminal.
                     In this notebook, we run the server and notebook code together, so their outputs are combined.
                     To improve clarity, the server logs are displayed in the original black color, while the notebook outputs are highlighted in blue.
+                    We are running those notebooks in a CI parallel environment, so the throughput is not representative of the actual performance.
                     """
                 )
                 break
 
-            if timeout and time.time() - start_time > timeout:
+            if timeout and time.perf_counter() - start_time > timeout:
                 raise TimeoutError("Server did not become ready within timeout period")
         except requests.exceptions.RequestException:
             time.sleep(1)
-
-
-def terminate_process(process):
-    from sglang.srt.utils import kill_process_tree
-
-    kill_process_tree(process.pid)
-
-
-def print_highlight(html_content: str):
-    html_content = str(html_content).replace("\n", "<br>")
-    display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
 
 
 class TypeBasedDispatcher:
@@ -415,3 +520,12 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
+
+
+def resolve_obj_by_qualname(qualname: str) -> Any:
+    """
+    Resolve an object by its fully qualified name.
+    """
+    module_name, obj_name = qualname.rsplit(".", 1)
+    module = importlib.import_module(module_name)
+    return getattr(module, obj_name)

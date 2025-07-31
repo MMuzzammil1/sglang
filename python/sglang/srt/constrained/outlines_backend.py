@@ -24,21 +24,16 @@ from outlines.models.transformers import TransformerTokenizer
 from pydantic import BaseModel
 
 from sglang.srt.constrained.base_grammar_backend import (
+    INVALID_GRAMMAR_OBJ,
     BaseGrammarBackend,
     BaseGrammarObject,
 )
 from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
-from sglang.srt.utils import is_hip
 
-is_hip_ = is_hip()
-
-if is_hip_:
+try:
+    from outlines.fsm.json_schema import build_regex_from_schema
+except ImportError:
     from outlines_core.fsm.json_schema import build_regex_from_schema
-else:
-    try:
-        from outlines.fsm.json_schema import build_regex_from_schema
-    except ImportError:
-        from outlines_core.fsm.json_schema import build_regex_from_schema
 
 
 logger = logging.getLogger(__name__)
@@ -50,6 +45,7 @@ class OutlinesGrammar(BaseGrammarObject):
         guide: RegexGuide,
         jump_forward_map: Union[OutlinesJumpForwardMap, None],
     ) -> None:
+        super().__init__()
         self.guide = guide
         self.jump_forward_map = jump_forward_map
         self.state = 0
@@ -57,6 +53,30 @@ class OutlinesGrammar(BaseGrammarObject):
 
     def accept_token(self, token: int):
         self.state = self.guide.get_next_state(self.state, token)
+
+    def allocate_vocab_mask(
+        self, vocab_size: int, batch_size: int, device
+    ) -> torch.Tensor:
+        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return vocab_mask
+
+    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        tokens = torch.tensor(
+            self.guide.get_next_instruction(self.state).tokens, dtype=torch.int64
+        ).to(vocab_mask.device, non_blocking=True)
+        vocab_mask = vocab_mask[idx]
+        vocab_mask.fill_(1)
+        vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
+        logits.masked_fill_(vocab_mask, float("-inf"))
+
+    def copy(self):
+        return OutlinesGrammar(self.guide, self.jump_forward_map)
 
     def try_jump_forward(self, tokenizer) -> Optional[Tuple]:
         if not self.jump_forward_map:
@@ -91,37 +111,12 @@ class OutlinesGrammar(BaseGrammarObject):
     ):
         self.state = next_state
 
-    def allocate_vocab_mask(
-        self, vocab_size: int, batch_size: int, device
-    ) -> torch.Tensor:
-        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
-
-    @staticmethod
-    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
-        return vocab_mask
-
-    def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
-        tokens = torch.tensor(
-            self.guide.get_next_instruction(self.state).tokens, dtype=torch.int64
-        ).to(vocab_mask.device, non_blocking=True)
-        vocab_mask = vocab_mask[idx]
-        vocab_mask.fill_(1)
-        vocab_mask.scatter_(0, tokens, torch.zeros_like(tokens, dtype=torch.bool))
-
-    @staticmethod
-    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor):
-        logits.masked_fill_(vocab_mask, float("-inf"))
-
-    def copy(self):
-        return OutlinesGrammar(self.guide, self.jump_forward_map)
-
 
 class OutlinesGrammarBackend(BaseGrammarBackend):
     def __init__(
         self,
         tokenizer,
         whitespace_pattern: bool,
-        allow_jump_forward: bool,
     ):
         super().__init__()
 
@@ -146,27 +141,9 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             self.outlines_tokenizer.vocabulary = (
                 self.outlines_tokenizer.tokenizer.get_vocab()
             )
-        self.allow_jump_forward = allow_jump_forward
         self.whitespace_pattern = whitespace_pattern
 
-    def init_value_impl(self, key: Tuple[str, str]) -> OutlinesGrammar:
-        key_type, key_string = key
-        if key_type == "json":
-            try:
-                regex = build_regex_from_object(
-                    key_string,
-                    whitespace_pattern=self.whitespace_pattern,
-                )
-            except (NotImplementedError, json.decoder.JSONDecodeError) as e:
-                logger.warning(
-                    f"Skip invalid json_schema: json_schema={key_string}, {e=}"
-                )
-                return None
-        elif key_type == "regex":
-            regex = key_string
-        else:
-            raise ValueError(f"Invalid key_type: {key_type}")
-
+    def _compile_regex(self, regex: str) -> Optional[OutlinesGrammar]:
         try:
             if hasattr(RegexGuide, "from_regex"):
                 # outlines >= 0.1.1
@@ -175,14 +152,31 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
                 # outlines <= 0.0.46
                 guide = RegexGuide(regex, self.outlines_tokenizer)
         except interegular.patterns.InvalidSyntax as e:
-            logger.warning(f"skip invalid regex schema: {regex=}, {e=}")
-            return None
+            logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
 
-        if self.allow_jump_forward:
-            jump_forward_map = OutlinesJumpForwardMap(regex)
-        else:
-            jump_forward_map = None
+        jump_forward_map = None
         return OutlinesGrammar(guide, jump_forward_map)
+
+    def dispatch_ebnf(self, key_string: str):
+        return super().dispatch_ebnf(key_string)
+
+    def dispatch_structural_tag(self, key_string: str):
+        return super().dispatch_structural_tag(key_string)
+
+    def dispatch_json(self, key_string: str):
+        try:
+            regex = build_regex_from_object(
+                key_string,
+                whitespace_pattern=self.whitespace_pattern,
+            )
+        except (NotImplementedError, json.decoder.JSONDecodeError, ValueError) as e:
+            logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
+            return INVALID_GRAMMAR_OBJ
+        return self._compile_regex(regex)
+
+    def dispatch_regex(self, key_string: str):
+        return self._compile_regex(key_string)
 
 
 def build_regex_from_object(

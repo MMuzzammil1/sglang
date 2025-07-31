@@ -20,6 +20,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only MiniCPM-V model compatible with HuggingFace weights."""
+
 from functools import partial
 from typing import (
     Any,
@@ -41,21 +42,20 @@ from torch import nn
 from torch.nn.init import trunc_normal_
 from transformers import PretrainedConfig
 
-from sglang.srt.distributed import divide, get_tensor_model_parallel_world_size
-from sglang.srt.layers.activation import get_act_fn
-from sglang.srt.layers.attention.vision import VisionAttention
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.managers.schedule_batch import ImageInputs
+from sglang.srt.managers.mm_utils import (
+    MultiModalityDataPaddingPatternTokenPairs,
+    general_mm_embed_routine,
+)
+from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.qwen2 import Qwen2Config, Qwen2ForCausalLM
+from sglang.srt.utils import add_prefix, flatten_nested_list
 
 RawImageType = Union[Image.Image, torch.Tensor]
 
@@ -142,286 +142,6 @@ def get_2d_sincos_pos_embed(
     return pos_embed
 
 
-class Idefics2VisionMLP(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.config = config
-        self.activation_fn = get_act_fn(config.hidden_act)
-        self.fc1 = ColumnParallelLinear(
-            config.hidden_size,
-            config.intermediate_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc1",
-        )
-        self.fc2 = RowParallelLinear(
-            config.intermediate_size,
-            config.hidden_size,
-            bias=True,
-            quant_config=quant_config,
-            prefix=f"{prefix}.fc2",
-        )
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states, _ = self.fc1(hidden_states)
-        hidden_states = self.activation_fn(hidden_states)
-        hidden_states, _ = self.fc2(hidden_states)
-        return hidden_states
-
-
-class Idefics2EncoderLayer(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.embed_dim = config.hidden_size
-
-        self.num_heads = config.num_attention_heads
-        tp_size = get_tensor_model_parallel_world_size()
-        num_heads_per_partition = divide(self.num_heads, tp_size)
-        self.self_attn = VisionAttention(
-            embed_dim=config.hidden_size,
-            num_heads=num_heads_per_partition,
-            projection_size=config.intermediate_size,
-            use_qkv_parallel=True,
-            quant_config=quant_config,
-            dropout=config.attention_dropout,
-            use_context_forward=False,
-            use_full_precision_softmax=True,
-            flatten_batch=False,
-            prefix=f"{prefix}.self_attn",
-        )
-        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-        self.mlp = Idefics2VisionMLP(config, quant_config=quant_config)
-        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Args:
-            hidden_states (`torch.FloatTensor`):
-                Input to the layer of shape `(batch, seq_len, embed_dim)`.
-
-        """
-        residual = hidden_states
-        hidden_states = self.layer_norm1(hidden_states)
-        hidden_states = self.self_attn(hidden_states, cu_seqlens=cu_seqlens)
-
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.layer_norm2(hidden_states)
-        hidden_states = self.mlp(hidden_states)
-        hidden_states = residual + hidden_states
-        return hidden_states
-
-
-class Idefics2Encoder(nn.Module):
-    """
-    Transformer encoder consisting of `config.num_hidden_layers` self attention
-    layers. Each layer is a
-    [`Idefics2EncoderLayer`].
-
-    Args:
-        config: Idefics2Config
-    """
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-
-        self.config = config
-        self.layers = nn.ModuleList(
-            [
-                Idefics2EncoderLayer(
-                    config,
-                    quant_config=quant_config,
-                )
-                for _ in range(config.num_hidden_layers)
-            ]
-        )
-
-    def forward(
-        self,
-        inputs_embeds: torch.Tensor,
-        cu_seqlens: torch.Tensor,
-    ) -> torch.Tensor:
-        r"""
-        Args:
-            inputs_embeds (torch.Tensor):
-                Optionally, instead of passing `input_ids` you can choose to
-                directly pass an embedded representation.
-                This is useful if you want more control over how to convert
-                `input_ids` indices into associated vectorsthan the model's
-                internal embedding lookup matrix.
-        """
-        hidden_states = inputs_embeds
-        for encoder_layer in self.layers:
-            layer_outputs = encoder_layer(
-                hidden_states,
-                cu_seqlens=cu_seqlens,
-            )
-            hidden_states = layer_outputs
-        return hidden_states
-
-
-class Idefics2VisionEmbeddings(nn.Module):
-    """
-    This is a modified version of `siglip.modelign_siglip.SiglipVisionEmbeddings
-    ` to enable images of variable
-    resolution.
-
-    The modifications are adapted from [Patch n' Pack: NaViT, a Vision
-    Transformer for any Aspect Ratio and Resolution](https://arxiv.org/abs/2307.06304)
-    which allows treating images in their native aspect ratio and without the
-    need to resize them to the same fixed size. In particular, we start from the
-    original pre-trained SigLIP model(which uses images of fixed-size square
-    images) and adapt it by training on images of variable resolutions.
-    """
-
-    def __init__(self, config: PretrainedConfig):
-        super().__init__()
-        self.embed_dim = config.hidden_size
-        self.image_size = config.image_size
-        self.patch_size = config.patch_size
-        self.patch_embedding = nn.Conv2d(
-            in_channels=config.num_channels,
-            out_channels=self.embed_dim,
-            kernel_size=self.patch_size,
-            stride=self.patch_size,
-            padding="valid",
-        )
-        self.num_patches_per_side = self.image_size // self.patch_size
-        self.num_patches = self.num_patches_per_side**2
-        self.num_positions = self.num_patches
-        self.position_embedding = nn.Embedding(self.num_positions, self.embed_dim)
-
-    def get_position_ids(
-        self,
-        pixel_values: torch.FloatTensor,
-        patch_attention_mask: torch.BoolTensor,
-        tgt_sizes: Optional[torch.IntTensor] = None,
-    ):
-        batch_size, _, max_im_h, max_im_w = pixel_values.shape
-
-        max_nb_patches_h, max_nb_patches_w = (
-            max_im_h // self.patch_size,
-            max_im_w // self.patch_size,
-        )
-        boundaries = torch.arange(
-            1 / self.num_patches_per_side, 1.0, 1 / self.num_patches_per_side
-        )
-        position_ids = torch.full(
-            size=(batch_size, max_nb_patches_h * max_nb_patches_w), fill_value=0
-        )
-
-        for batch_idx, p_attn_mask in enumerate(patch_attention_mask):
-
-            if tgt_sizes is not None:
-                nb_patches_h = tgt_sizes[batch_idx][0]
-                nb_patches_w = tgt_sizes[batch_idx][1]
-            else:
-                nb_patches_h = p_attn_mask[:, 0].sum()
-                nb_patches_w = p_attn_mask[0].sum()
-            fractional_coords_h = torch.arange(0, 1 - 1e-6, 1 / nb_patches_h)
-            fractional_coords_w = torch.arange(0, 1 - 1e-6, 1 / nb_patches_w)
-            bucket_coords_h = torch.bucketize(
-                fractional_coords_h, boundaries, right=True
-            )
-            bucket_coords_w = torch.bucketize(
-                fractional_coords_w, boundaries, right=True
-            )
-            pos_ids = (
-                bucket_coords_h[:, None] * self.num_patches_per_side + bucket_coords_w
-            ).flatten()
-            position_ids[batch_idx][p_attn_mask.view(-1).cpu()] = pos_ids
-        position_ids = position_ids.to(self.position_embedding.weight.device)
-        return position_ids
-
-    def forward(
-        self,
-        pixel_values: torch.FloatTensor,
-        patch_attention_mask: torch.BoolTensor,
-        tgt_sizes: Optional[torch.IntTensor] = None,
-    ) -> torch.Tensor:
-        target_dtype = self.patch_embedding.weight.dtype
-        pixel_values = pixel_values.to(
-            device=self.patch_embedding.weight.device, dtype=target_dtype
-        )
-        patch_embeds = self.patch_embedding(pixel_values)
-        embeddings = patch_embeds.flatten(2).transpose(1, 2)
-        position_ids = self.get_position_ids(
-            pixel_values, patch_attention_mask, tgt_sizes
-        )
-
-        embeddings = embeddings + self.position_embedding(position_ids)
-        return embeddings
-
-
-class Idefics2VisionTransformer(nn.Module):
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-    ) -> None:
-        super().__init__()
-
-        embed_dim = config.hidden_size
-        self.config = config
-        self.embeddings = Idefics2VisionEmbeddings(config)
-        self.encoder = Idefics2Encoder(config=config, quant_config=quant_config)
-        self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
-
-    def get_input_embeddings(self):
-        return self.embeddings
-
-    def compute_cu_seqlens(self, tgt_sizes: torch.Tensor) -> torch.Tensor:
-        patch_len = tgt_sizes[:, 0] * tgt_sizes[:, 1]  # shape: (batch_size,)
-        cu_seqlens = torch.cat(
-            [
-                torch.tensor([0], device=patch_len.device, dtype=torch.int32),
-                torch.cumsum(patch_len, dim=0, dtype=torch.int32),
-            ],
-            dim=0,
-        ).to(tgt_sizes.device)
-        return cu_seqlens
-
-    def forward(
-        self,
-        pixel_values,
-        patch_attention_mask: Optional[torch.BoolTensor] = None,
-        tgt_sizes: Optional[torch.IntTensor] = None,
-    ) -> torch.Tensor:
-        hidden_states = self.embeddings(
-            pixel_values=pixel_values,
-            patch_attention_mask=patch_attention_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        cu_seqlens = self.compute_cu_seqlens(tgt_sizes)
-        encoder_outputs = self.encoder(
-            hidden_states,
-            cu_seqlens=cu_seqlens,
-        )
-        last_hidden_state = self.post_layernorm(encoder_outputs)
-        return last_hidden_state
-
-
 class MiniCPMVImagePixelInputs(TypedDict):
     type: Literal["pixel_values"]
     data: List[torch.Tensor]
@@ -503,7 +223,7 @@ class BaseResampler(nn.Module):
                 embed_dim,
                 bias=False,
                 quant_config=quant_config,
-                prefix=f"{prefix}.kv_proj",
+                prefix=add_prefix("kv_proj", prefix),
             )
         else:
             # Maintain the same return value with ReplicatedLinear.forward
@@ -649,7 +369,7 @@ def get_version_by_config(config: PretrainedConfig) -> Tuple[int, ...]:
     return tuple(int(x) for x in version_str.split("."))
 
 
-class MiniCPMVBaseModel(nn.Module):
+class MiniCPMBaseModel(nn.Module):
     """
     The abstract class of MiniCPMV can only be inherited, but cannot be
     instantiated.
@@ -660,6 +380,7 @@ class MiniCPMVBaseModel(nn.Module):
         *,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         # All MiniCPM-V models disable `tie_word_embeddings` but
@@ -669,8 +390,12 @@ class MiniCPMVBaseModel(nn.Module):
         self.config = config
 
         self.version = get_version_by_config(self.config)
-        self.llm = self.init_llm(config=config, quant_config=quant_config)
-        self.vpm = self.init_vision_module(config, quant_config)
+        self.llm = self.init_llm(
+            config=config, quant_config=quant_config, prefix=add_prefix("llm", prefix)
+        )
+        self.vpm = self.init_vision_module(
+            config, quant_config, add_prefix("vpm", prefix)
+        )
         self.vision_dim = (
             self.vpm.embed_dim
             if self.version == (2, 0)
@@ -679,7 +404,10 @@ class MiniCPMVBaseModel(nn.Module):
         self.embed_dim = self.config.hidden_size
 
         self.resampler = self.init_resampler(
-            self.embed_dim, self.vision_dim, quant_config=quant_config
+            self.embed_dim,
+            self.vision_dim,
+            quant_config=quant_config,
+            prefix=add_prefix("resampler", prefix),
         )
 
         self.logits_processor = LogitsProcessor(config)
@@ -688,21 +416,21 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         pad_values: List[int],
-        im_start_id: torch.Tensor,
-        im_end_id: torch.Tensor,
-        slice_start_id: Optional[torch.Tensor] = None,
-        slice_end_id: Optional[torch.Tensor] = None,
+        im_start_id: int,
+        im_end_id: int,
+        slice_start_id: Optional[int] = None,
+        slice_end_id: Optional[int] = None,
     ) -> torch.Tensor:
         """
         Returns a tensor indicating the bounds (start and end token ids) of the images
         """
         # All the images in the batch should share the same special image
         # bound token ids.
-        start_cond = input_ids == im_start_id[0]
-        end_cond = input_ids == im_end_id[0]
+        start_cond = input_ids == im_start_id
+        end_cond = input_ids == im_end_id
         if slice_start_id is not None:
-            start_cond |= input_ids == slice_start_id[0]
-            end_cond |= input_ids == slice_end_id[0]
+            start_cond |= input_ids == slice_start_id
+            end_cond |= input_ids == slice_end_id
 
         (image_start_tokens,) = torch.where(start_cond)
         image_start_tokens += 1
@@ -713,6 +441,8 @@ class MiniCPMVBaseModel(nn.Module):
             if (
                 len(image_start_tokens) + 1 == len(image_end_tokens)
                 and input_ids[0] in pad_values
+                and len(image_start_tokens) != 0
+                and len(image_end_tokens) != 0
                 and image_end_tokens[0] < image_start_tokens[0]
             ):
                 image_start_tokens = torch.cat(
@@ -740,6 +470,59 @@ class MiniCPMVBaseModel(nn.Module):
         # Convert valid pairs to tensor
         valid_pairs_tensor = torch.tensor(valid_pairs, device=input_ids.device)
         return valid_pairs_tensor
+
+    def _parse_and_validate_inputs(
+        self,
+        input_ids: torch.Tensor,
+        **kwargs: object,
+    ) -> Optional[MiniCPMVImageInputs]:
+        pixel_values = kwargs.pop("pixel_values", [])
+        tgt_sizes = kwargs.pop("tgt_sizes", [])
+        im_start_id = kwargs.pop("im_start_id", None)
+        im_end_id = kwargs.pop("im_end_id", None)
+        slice_start_id = kwargs.pop("slice_start_id", None)
+        slice_end_id = kwargs.pop("slice_end_id", None)
+        image_embeds = kwargs.pop("image_embeds", None)
+        pad_values = kwargs.pop("pad_values", None)
+
+        if image_embeds is not None:
+            image_bounds = self._get_image_bounds(
+                input_ids=input_ids,
+                pad_values=pad_values,
+                im_start_id=im_start_id,
+                im_end_id=im_end_id,
+                slice_start_id=slice_start_id,
+                slice_end_id=slice_end_id,
+            )
+            if not isinstance(image_embeds, (torch.Tensor, list)):
+                raise ValueError(
+                    f"Incorrect type of image embeds. "
+                    f"Got type: {type(image_embeds)}"
+                )
+
+            if isinstance(image_embeds, list):
+                image_embeds = torch.cat(image_embeds)
+
+            return MiniCPMVImageEmbeddingInputs(
+                image_bounds=image_bounds,
+                data=image_embeds,
+                type="image_embeds",
+            )
+
+        image_bounds = self._get_image_bounds(
+            input_ids=input_ids,
+            pad_values=pad_values,
+            im_start_id=im_start_id,
+            im_end_id=im_end_id,
+            slice_start_id=slice_start_id,
+            slice_end_id=slice_end_id,
+        )
+        return MiniCPMVImagePixelInputs(
+            image_bounds=image_bounds.to(device=input_ids.device),
+            data=pixel_values,
+            tgt_sizes=tgt_sizes,
+            type="pixel_values",
+        )
 
     def get_embedding(
         self,
@@ -777,98 +560,8 @@ class MiniCPMVBaseModel(nn.Module):
 
         return vlm_embedding, vision_hidden_states
 
-    def _parse_and_validate_inputs(
-        self,
-        input_ids: torch.Tensor,
-        **kwargs: object,
-    ) -> Optional[MiniCPMVImageInputs]:
-        pixel_values = kwargs.pop("pixel_values", [])
-        tgt_sizes = kwargs.pop("tgt_sizes", [])
-        im_start_id = kwargs.pop("im_start_id", None)
-        im_end_id = kwargs.pop("im_end_id", None)
-        slice_start_id = kwargs.pop("slice_start_id", None)
-        slice_end_id = kwargs.pop("slice_end_id", None)
-        image_embeds = kwargs.pop("image_embeds", None)
-        pad_values = kwargs.pop("pad_values", None)
-
-        if image_embeds is not None:
-            image_bounds = self._get_image_bounds(
-                input_ids=input_ids,
-                pad_values=pad_values,
-                im_start_id=im_start_id,
-                im_end_id=im_end_id,
-                slice_start_id=slice_start_id,
-                slice_end_id=slice_end_id,
-            )
-            if not isinstance(image_embeds, (torch.Tensor, list)):
-                raise ValueError(
-                    f"Incorrect type of image embeds. "
-                    f"Got type: {type(image_embeds)}"
-                )
-
-            if isinstance(image_embeds, list):
-                image_embeds = torch.concat(image_embeds)
-
-            return MiniCPMVImageEmbeddingInputs(
-                image_bounds=image_bounds,
-                data=image_embeds,
-                type="image_embeds",
-            )
-
-        if not isinstance(pixel_values, (torch.Tensor, list)):
-            raise ValueError(
-                "Incorrect type of pixel values. " f"Got type: {type(pixel_values)}"
-            )
-
-        if not isinstance(tgt_sizes, (torch.Tensor, list)):
-            raise ValueError(
-                "Incorrect type of target sizes. " f"Got type: {type(tgt_sizes)}"
-            )
-
-        if len(pixel_values) != len(tgt_sizes):
-            raise ValueError(
-                "Inconsistent batch lengths, found: "
-                f"{len(pixel_values)} vs. {len(tgt_sizes)}"
-            )
-
-        pixel_values_flat: List[torch.Tensor] = []
-        tgt_sizes_flat: List[torch.Tensor] = []
-        for pixel_b, tgt_b in zip(pixel_values, tgt_sizes):
-            if len(pixel_b) != len(tgt_b):
-                raise ValueError(
-                    "Inconsistent N lengths, found: " f"{len(pixel_b)} vs {len(tgt_b)}"
-                )
-
-            for pixel_n, tgt_n in zip(pixel_b, tgt_b):
-                pixel_values_flat += pixel_n
-                tgt_sizes_flat += tgt_n
-
-        # NOTE: Input IDs does not contain image tokens during memory profiling,
-        # so we allow it to be empty
-        if len(pixel_values_flat) != len(tgt_sizes_flat):
-            raise ValueError(
-                "Inconsistent flattened lengths, found: "
-                f"{len(pixel_values_flat)} vs. "
-                f"{len(tgt_sizes_flat)}"
-            )
-
-        if len(pixel_values_flat) == 0:
-            return None
-
-        image_bounds = self._get_image_bounds(
-            input_ids=input_ids,
-            pad_values=pad_values,
-            im_start_id=im_start_id,
-            im_end_id=im_end_id,
-            slice_start_id=slice_start_id,
-            slice_end_id=slice_end_id,
-        )
-        return MiniCPMVImagePixelInputs(
-            image_bounds=image_bounds.to(device=input_ids.device),
-            data=pixel_values_flat,
-            tgt_sizes=torch.stack(tgt_sizes_flat),
-            type="pixel_values",
-        )
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.llm.get_input_embeddings()
 
     def forward(
         self,
@@ -877,66 +570,20 @@ class MiniCPMVBaseModel(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ) -> torch.Tensor:
-        if forward_batch.image_inputs is not None and forward_batch.image_inputs != [
-            None
-        ]:
-            kwargs.update(
-                {
-                    "pixel_values": (
-                        None
-                        if forward_batch.image_inputs is None
-                        else [
-                            i.pixel_values
-                            for i in forward_batch.image_inputs
-                            if i is not None
-                        ]
-                    ),
-                    "tgt_sizes": (
-                        None
-                        if forward_batch.image_inputs is None
-                        else [
-                            i.tgt_sizes
-                            for i in forward_batch.image_inputs
-                            if i is not None
-                        ]
-                    ),
-                    "im_start_id": forward_batch.image_inputs[0].im_start_id,
-                    "im_end_id": forward_batch.image_inputs[0].im_end_id,
-                    "slice_start_id": forward_batch.image_inputs[0].slice_start_id,
-                    "slice_end_id": forward_batch.image_inputs[0].slice_end_id,
-                    "pad_values": forward_batch.image_inputs[0].pad_values,
-                }
-            )
-
-        image_inputs = self._parse_and_validate_inputs(input_ids, **kwargs)
-
-        # Clamp input ids. This is because the input_ids for the image tokens are
-        # filled with the hash values of the image for the prefix matching in the radix attention.
-        # There values are useless because their embeddings will be replaced by vision embeddings anyway.
-        input_ids.clamp_(min=0, max=self.config.vocab_size - 1)
-
-        vlm_embeddings, _ = self.get_embedding(input_ids, image_inputs)
-
-        # always pass the input via `inputs_embeds`
-        # to make sure the computation graph is consistent
-        # for `torch.compile` integration
-        input_ids = None
-
-        hidden_states = self.llm.model(
+        hidden_states = general_mm_embed_routine(
             input_ids=input_ids,
-            positions=positions,
             forward_batch=forward_batch,
-            input_embeds=vlm_embeddings,
+            multimodal_model=self,
+            language_model=self.llm,
+            positions=positions,
         )
-
-        return self.logits_processor(
-            input_ids, hidden_states, self.llm.lm_head, forward_batch
-        )
+        return hidden_states
 
     def init_llm(
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
         raise NotImplementedError
 
@@ -944,6 +591,7 @@ class MiniCPMVBaseModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
     ) -> nn.Module:
         raise NotImplementedError
 
@@ -952,6 +600,7 @@ class MiniCPMVBaseModel(nn.Module):
         embed_dim: int,
         vision_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
         raise NotImplementedError
 
@@ -963,11 +612,11 @@ class MiniCPMVBaseModel(nn.Module):
     ) -> torch.Tensor:
         raise NotImplementedError
 
-    def get_vision_hidden_states(self, data: MiniCPMVImageInputs) -> torch.Tensor:
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         raise NotImplementedError
 
 
-class MiniCPMV2_6(MiniCPMVBaseModel):
+class MiniCPMV2_6(MiniCPMBaseModel):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -1011,24 +660,27 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
-        super().__init__(config=config, quant_config=quant_config)
+        super().__init__(config=config, quant_config=quant_config, prefix=prefix)
         assert self.version == (2, 6)
 
     def init_llm(
         self,
         config: Qwen2Config,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
-        return Qwen2ForCausalLM(config=config, quant_config=quant_config)
+        return Qwen2ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
 
     def init_vision_module(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig],
+        prefix: str = "",
     ) -> nn.Module:
         model = Idefics2VisionTransformer(
-            config=config.vision_config, quant_config=quant_config
+            config=config.vision_config, quant_config=quant_config, prefix=prefix
         )
         if self.config.drop_vision_last_layer:
             model.encoder.layers = model.encoder.layers[:-1]
@@ -1042,6 +694,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         embed_dim: int,
         vision_dim: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> nn.Module:
         with set_default_torch_dtype(torch.float16):
             # The resampler in 2.6 remains consistent with the one in 2.5.
@@ -1051,6 +704,7 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
                 num_heads=embed_dim // 128,
                 kv_dim=vision_dim,
                 quant_config=quant_config,
+                prefix=prefix,
             )
 
         return resampler.to(device="cuda", dtype=torch.get_default_dtype())
@@ -1068,12 +722,13 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return vision_embedding
 
-    def get_vision_hidden_states(
-        self,
-        data: MiniCPMVImageInputs,
-    ) -> torch.Tensor:
-        pixel_values = data["data"]
-        tgt_sizes = data["tgt_sizes"]
+    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
+        # list of tensors
+        pixel_values = flatten_nested_list([item.feature for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
 
         device = self.vpm.embeddings.position_embedding.weight.device
         dtype = self.vpm.embeddings.position_embedding.weight.dtype
@@ -1083,10 +738,10 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
 
         max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
         assert isinstance(max_patches, int)
-
         all_pixel_values = torch.nn.utils.rnn.pad_sequence(
             all_pixel_values_lst, batch_first=True, padding_value=0.0
         )
+
         B, L, _ = all_pixel_values.shape
         all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
         patch_attn_mask = torch.zeros(
@@ -1106,82 +761,17 @@ class MiniCPMV2_6(MiniCPMVBaseModel):
         )
         return self.resampler(vision_embedding, tgt_sizes)
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: ImageInputs):
-        if not isinstance(image_inputs.im_start_id, list) or not isinstance(
-            image_inputs.im_end_id, list
-        ):
-            return input_ids
-
-        new_input_ids = []
-        last_idx = 0
-        image_idx = -1
-        image_inputs.image_offsets = []
-
+    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
         # Get all special token IDs
-        im_start_id = (
-            image_inputs.im_start_id[0].item()
-            if isinstance(image_inputs.im_start_id[0], torch.Tensor)
-            else image_inputs.im_start_id[0]
-        )
-        im_end_id = (
-            image_inputs.im_end_id[0].item()
-            if isinstance(image_inputs.im_end_id[0], torch.Tensor)
-            else image_inputs.im_end_id[0]
-        )
-        slice_start_id = (
-            image_inputs.slice_start_id[0].item()
-            if isinstance(image_inputs.slice_start_id[0], torch.Tensor)
-            else image_inputs.slice_start_id[0]
-        )
-        slice_end_id = (
-            image_inputs.slice_end_id[0].item()
-            if isinstance(image_inputs.slice_end_id[0], torch.Tensor)
-            else image_inputs.slice_end_id[0]
-        )
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+        slice_start_id: int = image_inputs.slice_start_id
+        slice_end_id: int = image_inputs.slice_end_id
 
-        # Find all start and end positions for both types
-        start_indices = [
-            i
-            for i, x in enumerate(input_ids)
-            if x == im_start_id or x == slice_start_id
-        ]
-        end_indices = [
-            i for i, x in enumerate(input_ids) if x == im_end_id or x == slice_end_id
-        ]
+        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
+        pattern = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
 
-        if len(start_indices) != len(end_indices):
-            return input_ids
-        # Process each region (both image and slice)
-        for start_idx, end_idx in zip(start_indices, end_indices):
-            # Add non-image tokens before this region
-            new_input_ids.extend(
-                input_ids[last_idx : start_idx + 1]
-            )  # include start token
-
-            is_image_start = input_ids[start_idx] == im_start_id
-
-            if is_image_start:
-                image_inputs.image_offsets += [start_idx]
-                image_idx += 1
-
-            num_tokens = end_idx - start_idx - 1  # exclude start and end tokens
-
-            # Generate pad_ids
-            pad_values = [image_inputs.pad_values[image_idx]]
-
-            pad_ids = pad_values * ((num_tokens + len(pad_values)) // len(pad_values))
-            pad_ids = pad_ids[:num_tokens]
-
-            # Add pad_ids
-            new_input_ids.extend(pad_ids)
-
-            # Update last_idx to after end token
-            last_idx = end_idx
-
-        # Add remaining tokens after last region
-        new_input_ids.extend(input_ids[last_idx:])
-        assert len(input_ids) == len(new_input_ids)
-        return new_input_ids
+        return pattern.pad_input_tokens(input_ids, image_inputs)
 
 
 _SUPPORT_VERSION = {(2, 6): MiniCPMV2_6}
@@ -1207,6 +797,7 @@ class MiniCPMV:
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
 
@@ -1221,7 +812,9 @@ class MiniCPMV:
             raise ValueError("Currently, MiniCPMV only supports versions 2.6")
 
         try:
-            minicpmv = instance_class(config=config, quant_config=quant_config)
+            minicpmv = instance_class(
+                config=config, quant_config=quant_config, prefix=prefix
+            )
             self.minicpmv = minicpmv
         except Exception as e:
             print(f"Failed to instantiate MiniCPMV: {e}")

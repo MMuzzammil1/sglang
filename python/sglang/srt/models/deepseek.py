@@ -37,6 +37,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton import fused_moe
+from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -46,6 +47,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.utils import add_prefix
 
 
 class DeepseekMLP(nn.Module):
@@ -57,10 +59,15 @@ class DeepseekMLP(nn.Module):
         hidden_act: str,
         quant_config: Optional[QuantizationConfig] = None,
         reduce_results: bool = True,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
@@ -68,6 +75,7 @@ class DeepseekMLP(nn.Module):
             bias=False,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            prefix=add_prefix("down_proj", prefix),
         )
         if hidden_act != "silu":
             raise ValueError(
@@ -89,6 +97,7 @@ class DeepseekMoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.config = config
@@ -101,7 +110,10 @@ class DeepseekMoE(nn.Module):
                 f"Tensor parallel size {self.tp_size} is greater than "
                 f"the number of experts {self.n_routed_experts}."
             )
-
+        self.topk = TopK(
+            top_k=self.top_k,
+            renormalize=config.norm_topk_prob,
+        )
         self.experts = nn.ModuleList(
             [
                 DeepseekMLP(
@@ -110,6 +122,7 @@ class DeepseekMoE(nn.Module):
                     hidden_act=config.hidden_act,
                     quant_config=quant_config,
                     reduce_results=False,
+                    prefix=add_prefix(f"{idx}.experts", prefix),
                 )
                 for idx in range(self.n_routed_experts)
             ]
@@ -117,7 +130,11 @@ class DeepseekMoE(nn.Module):
         self.pack_params()
 
         self.gate = ReplicatedLinear(
-            config.hidden_size, self.n_routed_experts, bias=False, quant_config=None
+            config.hidden_size,
+            self.n_routed_experts,
+            bias=False,
+            quant_config=None,
+            prefix=add_prefix("gate", prefix),
         )
 
         if config.n_shared_experts is not None:
@@ -128,6 +145,7 @@ class DeepseekMoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                prefix=add_prefix("shared_experts", prefix),
             )
 
     def pack_params(self):
@@ -156,13 +174,12 @@ class DeepseekMoE(nn.Module):
             shared_output = self.shared_experts(hidden_states)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)
-        final_hidden_states = fused_moe(
+        topk_output = self.topk(hidden_states, router_logits)
+        final_hidden_states = fused_moe.fused_moe(
             hidden_states,
-            self.w1,
-            self.w2,
-            router_logits,
-            self.top_k,
-            renormalize=self.config.norm_topk_prob,
+            w1=self.w1,
+            w2=self.w2,
+            topk_output=topk_output,
             inplace=True,
         )
 
@@ -185,6 +202,7 @@ class DeepseekAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 8192,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -216,6 +234,7 @@ class DeepseekAttention(nn.Module):
             self.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
 
         self.o_proj = RowParallelLinear(
@@ -223,6 +242,7 @@ class DeepseekAttention(nn.Module):
             hidden_size,
             bias=False,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
 
         self.rotary_emb = get_rope(
@@ -238,6 +258,8 @@ class DeepseekAttention(nn.Module):
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -261,6 +283,7 @@ class DeepseekDecoderLayer(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -276,19 +299,25 @@ class DeepseekDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         if (
             config.n_routed_experts is not None
             and layer_id >= config.first_k_dense_replace
             and layer_id % config.moe_layer_freq == 0
         ):
-            self.mlp = DeepseekMoE(config=config, quant_config=quant_config)
+            self.mlp = DeepseekMoE(
+                config=config,
+                quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
+            )
         else:
             self.mlp = DeepseekMLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
+                prefix=add_prefix("mlp", prefix),
             )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -328,6 +357,7 @@ class DeepseekModel(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.padding_idx = config.pad_token_id
@@ -339,7 +369,12 @@ class DeepseekModel(nn.Module):
         )
         self.layers = nn.ModuleList(
             [
-                DeepseekDecoderLayer(config, layer_id, quant_config=quant_config)
+                DeepseekDecoderLayer(
+                    config,
+                    layer_id,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{layer_id}", prefix),
+                )
                 for layer_id in range(config.num_hidden_layers)
             ]
         )
@@ -350,8 +385,14 @@ class DeepseekModel(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+
+        if input_embeds is None:
+            hidden_states = self.embed_tokens(input_ids)
+        else:
+            hidden_states = input_embeds
+
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -368,15 +409,24 @@ class DeepseekForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = DeepseekModel(config, quant_config)
+        self.model = DeepseekModel(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.lm_head = ParallelLMHead(
-            config.vocab_size, config.hidden_size, quant_config=quant_config
+            config.vocab_size,
+            config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
         )
         self.logits_processor = LogitsProcessor(config)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def forward(
@@ -384,8 +434,9 @@ class DeepseekForCausalLM(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        hidden_states = self.model(input_ids, positions, forward_batch)
+        hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch
         )

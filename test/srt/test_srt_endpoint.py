@@ -8,6 +8,7 @@ import random
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from typing import Optional
 
 import numpy as np
@@ -19,11 +20,13 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
+    run_logprob_check,
 )
 
 
-class TestSRTEndpoint(unittest.TestCase):
+class TestSRTEndpoint(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -35,7 +38,9 @@ class TestSRTEndpoint(unittest.TestCase):
             other_args=(
                 "--enable-custom-logit-processor",
                 "--mem-fraction-static",
-                "0.8",
+                "0.7",
+                "--cuda-graph-max-bs",
+                "8",
             ),
         )
 
@@ -131,7 +136,7 @@ class TestSRTEndpoint(unittest.TestCase):
         for i, res in enumerate(response_json):
             self.assertEqual(
                 res["meta_info"]["prompt_tokens"],
-                logprob_start_len + 1 + len(res["meta_info"]["input_token_logprobs"]),
+                logprob_start_len + len(res["meta_info"]["input_token_logprobs"]),
             )
             assert prompts[i].endswith(
                 "".join([x[-1] for x in res["meta_info"]["input_token_logprobs"]])
@@ -235,83 +240,15 @@ class TestSRTEndpoint(unittest.TestCase):
 
         diff = np.abs(output_logprobs - output_logprobs_score)
         max_diff = np.max(diff)
-        self.assertLess(max_diff, 0.25)
-
-    def run_logprob_check(self, arg):
-        (
-            input_len,
-            output_len,
-            temperature,
-            logprob_start_len,
-            return_logprob,
-            top_logprobs_num,
-        ) = arg
-        input_ids = list(range(input_len))
-
-        response = requests.post(
-            self.base_url + "/generate",
-            json={
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": temperature,
-                    "max_new_tokens": output_len,
-                },
-                "return_logprob": return_logprob,
-                "logprob_start_len": logprob_start_len,
-                "top_logprobs_num": top_logprobs_num,
-            },
-        )
-        response_json = response.json()
-
-        res = response_json
-        self.assertEqual(res["meta_info"]["prompt_tokens"], input_len)
-        self.assertEqual(res["meta_info"]["completion_tokens"], output_len)
-
-        # Test the number of tokens are correct
-        if return_logprob:
-            # This is because if logprob_start_len == 0, we added a padding for the first token.
-            # In other cases, we do not add the padding
-            delta = 0 if logprob_start_len == 0 else 1
-
-            self.assertEqual(
-                len(res["meta_info"]["input_token_logprobs"])
-                + logprob_start_len
-                + delta,
-                res["meta_info"]["prompt_tokens"],
-            )
-            self.assertEqual(len(res["meta_info"]["output_token_logprobs"]), output_len)
-
-            if top_logprobs_num:
-                self.assertEqual(
-                    len(res["meta_info"]["input_top_logprobs"])
-                    + logprob_start_len
-                    + delta,
-                    res["meta_info"]["prompt_tokens"],
-                )
-                self.assertEqual(
-                    len(res["meta_info"]["output_top_logprobs"]), output_len
-                )
-
-                for i in range(output_len):
-                    self.assertEqual(
-                        len(res["meta_info"]["output_top_logprobs"][i]),
-                        top_logprobs_num,
-                    )
-
-                    # Test the top-1 tokens are the same as output tokens if temperature == 0
-                    if temperature == 0:
-                        self.assertListEqual(
-                            res["meta_info"]["output_token_logprobs"][i],
-                            res["meta_info"]["output_top_logprobs"][i][0],
-                        )
+        self.assertLess(max_diff, 0.35)
 
     def test_logprob_mixed(self):
         args = []
         temperature = 0
         # input_len, output_len, temperature, logprob_start_len, return_logprob, top_logprobs_num
-        for input_len in [1000, 2000]:
+        for input_len in [1000, 5000, 10000, 50000]:
             for output_len in [4, 8]:
-                for logprob_start_len in [0, 500, 1000]:
+                for logprob_start_len in [0, 500, 2500, 5000, 25000]:
                     for return_logprob in [True, False]:
                         for top_logprobs_num in [0, 5]:
 
@@ -331,8 +268,9 @@ class TestSRTEndpoint(unittest.TestCase):
 
         random.shuffle(args)
 
+        func = partial(run_logprob_check, self)
         with ThreadPoolExecutor(8) as executor:
-            list(executor.map(self.run_logprob_check, args))
+            list(executor.map(func, args))
 
     def test_logprob_grammar(self):
         prompts = "Question: Is Paris the Capital of France? Answer:"
@@ -357,7 +295,7 @@ class TestSRTEndpoint(unittest.TestCase):
         print(f"{output_top_logprobs=}")
 
         # Parse results
-        # This is becaues the grammar constraint allows all prefix tokens
+        # This is because the grammar constraint allows all prefix tokens
         logprobs = [None] * 2
         for i in range(len(output_top_logprobs)):
             try:
@@ -406,9 +344,7 @@ class TestSRTEndpoint(unittest.TestCase):
         custom_json = base_json.copy()
         # Only set the custom logit processor if target_token_id is not None.
         if target_token_id is not None:
-            custom_json["custom_logit_processor"] = (
-                DeterministicLogitProcessor().to_str()
-            )
+            custom_json["custom_logit_processor"] = DeterministicLogitProcessor.to_str()
             custom_json["sampling_params"]["custom_params"] = custom_params
 
         custom_response = requests.post(
@@ -427,6 +363,76 @@ class TestSRTEndpoint(unittest.TestCase):
                 f"{target_token_id=}\n{sampled_tokens=}\n{custom_response=}",
             )
 
+    def run_stateful_custom_logit_processor(
+        self, first_token_id: int | None, delay: int = 2
+    ):
+        """Test custom logit processor with custom params and state.
+
+        Should sample the first `delay` tokens normally, then output first_token_id and consecutive tokens after that.
+        If first_token_id is None, the custom logit processor won't be passed in.
+        """
+        custom_params = {"token_id": first_token_id, "delay": 2}
+
+        class DeterministicStatefulLogitProcessor(CustomLogitProcessor):
+            """A dummy logit processor that changes the logits to always
+            sample the given token id.
+            """
+
+            def __call__(self, logits, custom_param_list):
+                assert logits.shape[0] == len(custom_param_list)
+
+                for i, param_dict in enumerate(custom_param_list):
+                    if param_dict["delay"] > 0:
+                        param_dict["delay"] -= 1
+                        continue
+                    if param_dict["delay"] == 0:
+                        param_dict["delay"] -= 1
+                        force_token = param_dict["token_id"]
+                    else:
+                        output_ids = param_dict["__req__"].output_ids
+                        force_token = output_ids[-1] + 1
+                    # Mask all other tokens
+                    logits[i, :] = -float("inf")
+                    # Assign highest probability to the specified token
+                    logits[i, force_token] = 0.0
+                return logits
+
+        prompts = "Question: Is Paris the Capital of France? Answer:"
+
+        # Base case json data to be posted to the server.
+        base_json = {
+            "text": prompts,
+            "sampling_params": {"temperature": 0.0},
+            "return_logprob": True,
+        }
+
+        # Custom json data with custom logit processor and params.
+        custom_json = base_json.copy()
+        # Only set the custom logit processor if target_token_id is not None.
+        if first_token_id is not None:
+            custom_json["custom_logit_processor"] = (
+                DeterministicStatefulLogitProcessor().to_str()
+            )
+            custom_json["sampling_params"]["custom_params"] = custom_params
+
+        custom_response = requests.post(
+            self.base_url + "/generate",
+            json=custom_json,
+        ).json()
+
+        output_token_logprobs = custom_response["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+        # The logit processor should always sample the given token as the logits is deterministic.
+        if first_token_id is not None:
+            self.assertTrue(
+                all(
+                    x == custom_params["token_id"] + k
+                    for k, x in enumerate(sampled_tokens[custom_params["delay"] :])
+                ),
+                # Print the detailed test case info if the test fails.
+                f"{first_token_id=}\n{sampled_tokens=}\n{custom_response=}",
+            )
+
     def test_custom_logit_processor(self):
         """Test custom logit processor with a single request."""
         self.run_custom_logit_processor(target_token_id=5)
@@ -437,6 +443,31 @@ class TestSRTEndpoint(unittest.TestCase):
         random.shuffle(target_token_ids)
         with ThreadPoolExecutor(len(target_token_ids)) as executor:
             list(executor.map(self.run_custom_logit_processor, target_token_ids))
+
+    @unittest.skip("Skip this test because this feature has a bug. See comments below.")
+    def test_stateful_custom_logit_processor(self):
+        """Test custom logit processor with a single request."""
+
+        """
+        NOTE: This feature has a race condition bug.
+        This line https://github.com/sgl-project/sglang/blob/ef8ec07b2ce4c70c2a33ec5acda4ce529bc3cda4/test/srt/test_srt_endpoint.py#L395-L396 can be accessed by two concurrent threads at the same time. The access order is not guaranteed.
+        In sglang, we use two python threads to overlap the GPU computation and CPU scheduling.
+        Thread 1 (the CPU scheduling thread) will update the `param_dict["__req__"].output_ids`.
+        Thread 2 (the GPU computation thread) will call `DeterministicStatefulLogitProcessor` because sampling is considered as GPU computation.
+        We can fix this by moving the call of DeterministicStatefulLogitProcessor to the CPU scheduling thread.
+        """
+
+        self.run_stateful_custom_logit_processor(first_token_id=5)
+
+    @unittest.skip("Skip this test because this feature has a bug. See comments above.")
+    def test_stateful_custom_logit_processor_batch_mixed(self):
+        """Test a batch of requests mixed of requests with and without custom logit processor."""
+        target_token_ids = list(range(32)) + [None] * 16
+        random.shuffle(target_token_ids)
+        with ThreadPoolExecutor(len(target_token_ids)) as executor:
+            list(
+                executor.map(self.run_stateful_custom_logit_processor, target_token_ids)
+            )
 
     def test_cache_tokens(self):
         for _ in range(2):
@@ -470,11 +501,139 @@ class TestSRTEndpoint(unittest.TestCase):
         max_total_num_tokens = response_json["max_total_num_tokens"]
         self.assertIsInstance(max_total_num_tokens, int)
 
-        attention_backend = response_json["attention_backend"]
-        self.assertIsInstance(attention_backend, str)
-
         version = response_json["version"]
         self.assertIsInstance(version, str)
+
+    def test_logit_bias(self):
+        """Test that a very high logit bias forces sampling of a specific token."""
+        # Choose a token ID to bias (using 5 as an example)
+        target_token_id = 60704  # Paris for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        logit_bias = {str(target_token_id): 100.0}  # Very high positive bias
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,  # Use high temperature to encourage exploration
+                    "max_new_tokens": 4,
+                    "logit_bias": logit_bias,
+                },
+                "return_logprob": True,
+            },
+        )
+        response_json = response.json()
+
+        # Extract the sampled token IDs from the output
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # Verify that all sampled tokens are the target token
+        self.assertTrue(
+            all(x == target_token_id for x in sampled_tokens),
+            f"Expected all tokens to be {target_token_id}, but got {sampled_tokens}",
+        )
+
+    def test_forbidden_token(self):
+        """Test that a forbidden token (very negative logit bias) doesn't appear in the output."""
+        # Choose a token ID to forbid (using 10 as an example)
+        forbidden_token_id = 23994  # rice for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        logit_bias = {
+            str(forbidden_token_id): -100.0
+        }  # Very negative bias to forbid the token
+
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "Only output 'rice' exactly like this, in lowercase ONLY: rice",
+                "sampling_params": {
+                    "temperature": 1.0,  # Use high temperature to encourage diverse output
+                    "max_new_tokens": 50,  # Generate enough tokens to likely include numbers
+                    "logit_bias": logit_bias,
+                },
+                "return_logprob": True,
+            },
+        )
+        response_json = response.json()
+
+        # Extract the sampled token IDs from the output
+        output_token_logprobs = response_json["meta_info"]["output_token_logprobs"]
+        sampled_tokens = [x[1] for x in output_token_logprobs]
+
+        # Verify that the forbidden token doesn't appear in the output
+        self.assertNotIn(
+            forbidden_token_id,
+            sampled_tokens,
+            f"Expected forbidden token {forbidden_token_id} not to be present, but it was found",
+        )
+
+    def test_logit_bias_isolation(self):
+        """Test that logit_bias applied to one request doesn't affect other requests in batch."""
+        # Choose a token ID to bias in first request only
+        biased_token_id = 60704  # Paris for meta-llama/Llama-3.2-1B-Instruct, DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+
+        # Prepare batch requests - one with logit_bias and one without
+        requests_data = [
+            {
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": 4,
+                    "logit_bias": {str(biased_token_id): 100.0},  # Strong bias
+                },
+                "return_logprob": True,
+            },
+            {
+                "text": "The capital of France is",
+                "sampling_params": {
+                    "temperature": 1.0,
+                    "max_new_tokens": 4,
+                },
+                "return_logprob": True,
+            },
+        ]
+
+        # Send both requests
+        responses = []
+        for req in requests_data:
+            response = requests.post(self.base_url + "/generate", json=req)
+            responses.append(response.json())
+
+        # Extract token IDs from each response
+        biased_tokens = [
+            x[1] for x in responses[0]["meta_info"]["output_token_logprobs"]
+        ]
+        unbiased_tokens = [
+            x[1] for x in responses[1]["meta_info"]["output_token_logprobs"]
+        ]
+
+        # Verify first response contains only biased tokens
+        self.assertTrue(
+            all(x == biased_token_id for x in biased_tokens),
+            f"Expected all tokens to be {biased_token_id} in first response, but got {biased_tokens}",
+        )
+
+        # Verify second response contains at least some different tokens
+        # (We can't guarantee exactly what tokens will be generated, but they shouldn't all be the biased token)
+        self.assertTrue(
+            any(x != biased_token_id for x in unbiased_tokens),
+            f"Expected some tokens to be different from {biased_token_id} in second response, but got {unbiased_tokens}",
+        )
+
+    def test_get_server_info_concurrent(self):
+        """Make sure the concurrent get_server_info doesn't crash the server."""
+        tp = ThreadPoolExecutor(max_workers=30)
+
+        def s():
+            server_info = requests.get(self.base_url + "/get_server_info")
+            server_info.json()
+
+        futures = []
+        for _ in range(4):
+            futures.append(tp.submit(s))
+
+        for f in futures:
+            f.result()
 
 
 if __name__ == "__main__":

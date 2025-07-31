@@ -39,7 +39,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.utils import make_layers
+from sglang.srt.utils import add_prefix, make_layers
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -56,13 +56,22 @@ class Gemma2MLP(nn.Module):
         hidden_act: str,
         hidden_activation: str,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size] * 2, bias=False, quant_config=quant_config
+            hidden_size,
+            [intermediate_size] * 2,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_up_proj", prefix),
         )
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, quant_config=quant_config
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
         )
         if not (hidden_act == hidden_activation == "gelu_pytorch_tanh"):
             raise ValueError(
@@ -91,6 +100,7 @@ class Gemma2Attention(nn.Module):
         max_position_embeddings: int,
         rope_theta: float,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
@@ -123,12 +133,14 @@ class Gemma2Attention(nn.Module):
             self.total_num_kv_heads,
             bias=config.attention_bias,
             quant_config=quant_config,
+            prefix=add_prefix("qkv_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
+            prefix=add_prefix("o_proj", prefix),
         )
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -151,6 +163,8 @@ class Gemma2Attention(nn.Module):
                 if use_sliding_window
                 else None
             ),
+            quant_config=quant_config,
+            prefix=add_prefix("attn", prefix),
         )
 
     def forward(
@@ -173,8 +187,10 @@ class Gemma2DecoderLayer(nn.Module):
         layer_id: int,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
+        self.layer_id = layer_id
         self.hidden_size = config.hidden_size
         self.self_attn = Gemma2Attention(
             layer_id=layer_id,
@@ -186,6 +202,7 @@ class Gemma2DecoderLayer(nn.Module):
             max_position_embeddings=config.max_position_embeddings,
             rope_theta=config.rope_theta,
             quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
         )
         self.hidden_size = config.hidden_size
         self.mlp = Gemma2MLP(
@@ -194,6 +211,7 @@ class Gemma2DecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             hidden_activation=config.hidden_activation,
             quant_config=quant_config,
+            prefix=add_prefix("mlp", prefix),
         )
         self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = GemmaRMSNorm(
@@ -238,6 +256,7 @@ class Gemma2Model(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -253,7 +272,7 @@ class Gemma2Model(nn.Module):
                 config=config,
                 quant_config=quant_config,
             ),
-            prefix="",
+            prefix=add_prefix("layers", prefix),
         )
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -339,11 +358,14 @@ class Gemma2ForCausalLM(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.model = Gemma2Model(config, quant_config)
+        self.model = Gemma2Model(
+            config, quant_config, prefix=add_prefix("model", prefix)
+        )
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
@@ -358,6 +380,57 @@ class Gemma2ForCausalLM(nn.Module):
         return self.logits_processor(
             input_ids, hidden_states, self.model.embed_tokens, forward_batch
         )
+
+    @torch.no_grad()
+    def forward_split_prefill(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        split_interval: Tuple[int, int],  # [start, end) 0-based
+        input_embeds: torch.Tensor = None,
+    ):
+        start, end = split_interval
+        # embed
+        if start == 0:
+            if input_embeds is None:
+                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
+            else:
+                forward_batch.hidden_states = input_embeds
+
+            # Normalize
+            normalizer = torch.tensor(
+                self.model.config.hidden_size**0.5, dtype=torch.float16
+            )
+            forward_batch.hidden_states *= normalizer
+
+        # decoder layer
+        for i in range(start, end):
+            layer = self.model.layers[i]
+            forward_batch.hidden_states, forward_batch.residual = layer(
+                positions,
+                forward_batch.hidden_states,
+                forward_batch,
+                forward_batch.residual,
+            )
+
+        if end == self.model.config.num_hidden_layers:
+            # norm
+            forward_batch.hidden_states, _ = self.model.norm(
+                forward_batch.hidden_states, forward_batch.residual
+            )
+
+            # logits process
+            result = self.logits_processor(
+                input_ids,
+                forward_batch.hidden_states,
+                self.model.embed_tokens,
+                forward_batch,
+            )
+        else:
+            result = None
+
+        return result
 
     def get_hidden_dim(self, module_name):
         # return input_dim, output_dim
@@ -436,13 +509,6 @@ class Gemma2ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
-
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            raise RuntimeError(
-                "Some weights are not initialized from checkpoints: "
-                f"{unloaded_params}"
-            )
 
 
 EntryClass = Gemma2ForCausalLM

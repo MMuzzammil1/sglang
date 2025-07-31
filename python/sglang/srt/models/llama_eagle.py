@@ -13,6 +13,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+from sglang.srt.utils import add_prefix
+
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py
 """Inference-only LLaMA-EAGLE model compatible with HuggingFace weights."""
@@ -23,13 +25,14 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from sglang.srt.distributed import get_pp_group
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
 
 
@@ -55,6 +58,7 @@ class LlamaModel(nn.Module):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.config = config
@@ -62,11 +66,15 @@ class LlamaModel(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
+            prefix=add_prefix("embed_tokens", prefix),
         )
         self.layers = nn.ModuleList(
             [
                 LlamaDecoderLayer(
-                    config, i, quant_config=quant_config, prefix=f"model.layers.{i}"
+                    config,
+                    i,
+                    quant_config=quant_config,
+                    prefix=add_prefix(f"layers.{i}", prefix),
                 )
                 for i in range(config.num_hidden_layers)
             ]
@@ -79,6 +87,7 @@ class LlamaModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
+        pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
@@ -106,21 +115,29 @@ class LlamaForCausalLMEagle(LlamaForCausalLM):
         self,
         config: LlamaConfig,
         quant_config: Optional[QuantizationConfig] = None,
-        cache_config=None,
+        prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
         self.quant_config = quant_config
-        self.model = LlamaModel(config, quant_config=quant_config)
+        self.pp_group = get_pp_group()
+        self.model = LlamaModel(
+            config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
         # Llama 3.2 1B Instruct set tie_word_embeddings to True
         # Llama 3.1 8B Instruct set tie_word_embeddings to False
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
         else:
             self.lm_head = ParallelLMHead(
-                config.vocab_size, config.hidden_size, quant_config=quant_config
+                getattr(config, "hot_vocab_size", config.vocab_size),
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("lm_head", prefix),
             )
+
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         for name, loaded_weight in weights:
