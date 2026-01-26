@@ -162,6 +162,9 @@ class ReqState:
     output_token_ids_logprobs_val: List = dataclasses.field(default_factory=list)
     output_token_ids_logprobs_idx: List = dataclasses.field(default_factory=list)
 
+    # Store the original request object for access to headers
+    request: Optional[fastapi.Request] = None
+
 
 class InputFormat(Enum):
     """Input format types for tokenization handling."""
@@ -487,7 +490,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             # Tokenize the request and send it to the scheduler
             if obj.is_single:
                 tokenized_obj = await self._tokenize_one_request(obj)
-                state = self._send_one_request(obj, tokenized_obj, created_time)
+                state = self._send_one_request(
+                    obj, tokenized_obj, created_time, request
+                )
                 async for response in self._wait_one_response(obj, state, request):
                     yield response
             else:
@@ -1029,11 +1034,15 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
         obj: Union[GenerateReqInput, EmbeddingReqInput],
         tokenized_obj: Union[TokenizedGenerateReqInput, TokenizedEmbeddingReqInput],
         created_time: Optional[float] = None,
+        request: Optional[fastapi.Request] = None,
     ):
         trace_slice_start(RequestStage.TOKENIZER_DISPATCH, obj.rid)
         tokenized_obj.trace_context = trace_get_proc_propagate_context(obj.rid)
         self.send_to_scheduler.send_pyobj(tokenized_obj)
         state = ReqState([], False, asyncio.Event(), obj, created_time=created_time)
+        # Store the request object for later access to headers
+        if request is not None:
+            state.request = request
         state.request_sent_to_scheduler_ts = time.time()
         self.rid_to_state[obj.rid] = state
         trace_slice_end(
@@ -1208,7 +1217,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                         tmp_obj = obj[i]
                         tokenized_obj = await self._tokenize_one_request(tmp_obj)
                         state = self._send_one_request(
-                            tmp_obj, tokenized_obj, created_time
+                            tmp_obj, tokenized_obj, created_time, request
                         )
                         generators.append(
                             self._wait_one_response(tmp_obj, state, request)
@@ -1237,7 +1246,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 tokenized_obj.sampling_params = copy.copy(tokenized_obj.sampling_params)
                 tokenized_obj.sampling_params.max_new_tokens = 0
                 tokenized_obj.stream = False
-                state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                state = self._send_one_request(
+                    tmp_obj, tokenized_obj, created_time, request
+                )
                 await self._wait_one_response(tmp_obj, state, request).__anext__()
 
             # Expand requests, assign new rids for them, and send them
@@ -1246,7 +1257,9 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                     tmp_obj = copy.copy(objs[i])
                     tokenized_obj = copy.copy(tokenized_objs[i])
                     tokenized_obj.rid = tmp_obj.regenerate_rid()
-                    state = self._send_one_request(tmp_obj, tokenized_obj, created_time)
+                    state = self._send_one_request(
+                        tmp_obj, tokenized_obj, created_time, request
+                    )
                     generators.append(self._wait_one_response(tmp_obj, state, request))
                     rids.append(tmp_obj.rid)
 
@@ -1569,7 +1582,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
 
             # Log metrics and dump
             if self.enable_metrics and state.obj.log_metrics:
-                self.collect_metrics(state, recv_obj, i)
+                # Extract request headers from the stored request object if available
+                request_headers = None
+                if hasattr(state, "request") and state.request is not None:
+                    request_headers = dict(state.request.headers)
+
+                self.collect_metrics(state, recv_obj, i, request_headers)
             if self.dump_requests_folder and state.finished and state.obj.log_metrics:
                 self.dump_requests(state, out_dict)
             if self.crash_dump_folder and state.finished and state.obj.log_metrics:
@@ -1841,7 +1859,13 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
             or obj.sampling_params.get("structural_tag", None)
         )
 
-    def collect_metrics(self, state: ReqState, recv_obj: BatchStrOutput, i: int):
+    def collect_metrics(
+        self,
+        state: ReqState,
+        recv_obj: BatchStrOutput,
+        i: int,
+        request_headers: Optional[Dict[str, str]] = None,
+    ):
         completion_tokens = (
             recv_obj.completion_tokens[i]
             if getattr(recv_obj, "completion_tokens", None)
@@ -1893,6 +1917,7 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 state.finished_time - state.created_time,
                 self._request_has_grammar(state.obj),
                 retraction_count,
+                request_headers,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):
