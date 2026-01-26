@@ -1166,7 +1166,25 @@ class TokenizerMetricsCollector:
         e2e_latency: float,
         has_grammar: bool,
         retraction_count: int,
+        request_headers: Optional[Dict[str, str]] = None,
     ):
+        # Extract session_id from request headers
+        session_id = "N/A"
+        if request_headers:
+            for header_name in ["x-session-id", "x-session-token"]:
+                if header_name in request_headers:
+                    session_id = request_headers[header_name]
+                    break
+
+        # Calculate metrics
+        total_tokens = prompt_tokens + generation_tokens
+        new_tokens = generation_tokens
+
+        # Log the required information
+        logger.info(
+            f"session_id: {session_id}, total_tokens: {total_tokens}, cached_tokens: {cached_tokens}, new_tokens: {new_tokens}, e2e_latency: {e2e_latency}"
+        )
+
         self.prompt_tokens_total.labels(**labels).inc(prompt_tokens)
         self.generation_tokens_total.labels(**labels).inc(generation_tokens)
         if cached_tokens > 0:
