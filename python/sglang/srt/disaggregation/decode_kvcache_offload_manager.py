@@ -79,6 +79,7 @@ class DecodeKVCacheOffloadManager:
             storage_backend_extra_config=server_args.hicache_storage_backend_extra_config,
         )
 
+        self.enable_storage = server_args.hicache_storage_backend is not None
         self.ongoing_offload = {}
         self.ongoing_backup = {}
         logger.info("Enable offload kv cache for decode side")
@@ -143,21 +144,29 @@ class DecodeKVCacheOffloadManager:
         """Check the progress of offload from device to host and backup from host to storage."""
         cc = self.cache_controller
 
-        qsizes = torch.tensor(
-            [
-                len(cc.ack_write_queue),
-                cc.ack_backup_queue.qsize(),
-            ],
-            dtype=torch.int,
-        )
+        if self.enable_storage:
+            qsizes = torch.tensor(
+                [
+                    len(cc.ack_write_queue),
+                    cc.ack_backup_queue.qsize(),
+                ],
+                dtype=torch.int,
+            )
+        else:
+            qsizes = torch.tensor([len(cc.ack_write_queue)], dtype=torch.int)
+
         if self.tp_world_size > 1:
             torch.distributed.all_reduce(
                 qsizes, op=torch.distributed.ReduceOp.MIN, group=self.tp_group
             )
 
-        n_write, n_backup = map(int, qsizes.tolist())
-        self._check_offload_progress(n_write)
-        self._check_backup_progress(n_backup)
+        if self.enable_storage:
+            n_write, n_backup = map(int, qsizes.tolist())
+            self._check_offload_progress(n_write)
+            self._check_backup_progress(n_backup)
+        else:
+            n_write = int(qsizes.tolist()[0])
+            self._check_offload_progress(n_write)
 
     def _check_offload_progress(self, finish_count):
         """Check the progress of offload from device to host."""
@@ -174,13 +183,15 @@ class DecodeKVCacheOffloadManager:
                 ) = self.ongoing_offload.pop(ack_id)
 
                 self._release_finished_req(req, prefill_offloaded_len)
-                self._trigger_backup(
-                    req,
-                    host_indices,
-                    incremental_tokens,
-                    start_time,
-                    prefill_offloaded_len,
-                )
+
+                if self.enable_storage:
+                    self._trigger_backup(
+                        req,
+                        host_indices,
+                        incremental_tokens,
+                        start_time,
+                        prefill_offloaded_len,
+                    )
             finish_count -= 1
 
     def _release_finished_req(self, req: Req, prefill_offloaded_len: int):
