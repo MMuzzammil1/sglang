@@ -15,7 +15,7 @@ from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import GenerationBatchResult
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 
 
 logger = logging.getLogger(__name__)
@@ -45,6 +45,17 @@ class GenerationBatchResult:
 
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
+
+    # PP-disagg spec: produced by PP-N-1, carried through output ring
+    spec_accept_index: Optional[torch.Tensor] = None
+    spec_evict_mask: Optional[torch.Tensor] = None
+    spec_extend_kv_slots: Optional[torch.Tensor] = None  # slots written by draft_extend
+    spec_extend_kv_data: Optional[torch.Tensor] = None   # raw KV data at those slots
+
+    # PP-disagg spec: produced by PP-0, carried in proxy channel (forward)
+    pp_spec_verify_input: Optional["EagleVerifyInput"] = None
+    pp_draft_kv_slots: Optional[torch.Tensor] = None  # slots written by draft()
+    pp_draft_kv_data: Optional[torch.Tensor] = None   # raw KV data at those slots
 
     # metrics
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None

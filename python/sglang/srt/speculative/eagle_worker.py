@@ -703,7 +703,12 @@ class EAGLEWorker(TpModelWorker):
         # allocator and kv cache pool are shared with target worker
         pass
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+    def verify(
+        self,
+        batch: ScheduleBatch,
+        spec_info: EagleVerifyInput,
+        pp_proxy_tensors=None,
+    ):
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
@@ -727,9 +732,9 @@ class EAGLEWorker(TpModelWorker):
                 spec_info.retrive_next_token.shape
             ).cpu()
 
-        # Forward
+        # Forward (pp_proxy_tensors is non-None on PP-N-1 in pipeline parallelism)
         batch_result = self.target_worker.forward_batch_generation(
-            model_worker_batch, is_verify=True
+            model_worker_batch, is_verify=True, pp_proxy_tensors=pp_proxy_tensors
         )
         logits_output, can_run_cuda_graph = (
             batch_result.logits_output,

@@ -647,6 +647,27 @@ class Scheduler(
                 f"Using draft model load_format: '{self.server_args.speculative_draft_load_format}'"
             )
 
+        # PP disagg-decode + EAGLE spec: only PP-0 and PP-N-1 instantiate a draft
+        # worker; intermediate ranks use the target worker directly.
+        if (
+            self.spec_algorithm.is_eagle()
+            and self.server_args.disaggregation_mode == "decode"
+            and self.pp_size > 1
+        ):
+            if self.pp_rank == 0:
+                from sglang.srt.speculative.standalone_worker import EaglePPFirstWorker
+
+                self.draft_worker = EaglePPFirstWorker(**draft_worker_kwargs)
+            elif self.pp_rank == self.pp_size - 1:
+                from sglang.srt.speculative.standalone_worker import EaglePPLastWorker
+
+                self.draft_worker = EaglePPLastWorker(**draft_worker_kwargs)
+            else:
+                # Intermediate ranks run target-only; expose tp_worker as model_worker.
+                self.draft_worker = self.tp_worker
+            self.external_corpus_manager = None
+            return
+
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
         self.draft_worker = DraftWorkerClass(**draft_worker_kwargs)
 

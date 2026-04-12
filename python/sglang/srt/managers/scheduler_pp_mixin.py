@@ -384,6 +384,23 @@ class SchedulerPPMixin:
                     if not self.cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
+                    # Spec+PP disagg: set batch.spec_info on PP-0 from cached verify input
+                    if (
+                        self.pp_group.is_first_rank
+                        and self._spec_verify_inputs[mb_id] is not None
+                    ):
+                        self.cur_batch.spec_info = self._spec_verify_inputs[mb_id]
+                        self._spec_verify_inputs[mb_id] = None
+
+                    # Spec+PP disagg: on PP-N-1, reconstruct EagleVerifyInput from proxy
+                    if (
+                        self.pp_group.is_last_rank
+                        and pp_proxy_tensors is not None
+                    ):
+                        self._spec_extract_verify_input_from_proxy(
+                            pp_proxy_tensors, self.cur_batch
+                        )
+
                 # early send output if possible
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
@@ -467,6 +484,7 @@ class SchedulerPPMixin:
                         self._pp_process_batch_result(
                             self.mbs[next_mb_id],
                             next_batch_result,
+                            mb_id=next_mb_id,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
@@ -485,8 +503,19 @@ class SchedulerPPMixin:
                     )
                     if self.cur_batch and not self.cur_batch.forward_mode.is_prebuilt():
                         torch.cuda.current_stream().wait_event(self.launch_event)
+                        proxy_out = result.pp_hidden_states_proxy_tensors.tensors
+                        if self.pp_group.is_first_rank:
+                            # Spec+PP disagg: embed EagleVerifyInput + draft KV so
+                            # PP-N-1 can reconstruct batch.spec_info
+                            self._spec_embed_verify_input_in_proxy(proxy_out, result)
+                        elif pp_proxy_tensors is not None:
+                            # Intermediate ranks: thread spec fields from incoming
+                            # proxy to outgoing so they reach PP-N-1 unchanged
+                            for key, val in pp_proxy_tensors.tensors.items():
+                                if key.startswith("spec_"):
+                                    proxy_out[key] = val
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.tensors,
+                            proxy_out,
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -535,6 +564,11 @@ class SchedulerPPMixin:
         self._pp_tensor_dict_inbox: Dict[str, deque[Dict[str, torch.Tensor]]] = (
             defaultdict(deque)
         )
+
+        # Per-microbatch EagleVerifyInput produced by draft() on PP-0 in spec+PP disagg mode.
+        # PP-0 stores the next verify input here after run_draft_after_recv(); the loop
+        # picks it up on the following iteration and sets batch.spec_info before launch.
+        self._spec_verify_inputs: List[Optional[object]] = [None] * self.pp_loop_size
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -917,6 +951,77 @@ class SchedulerPPMixin:
 
         return data
 
+    def _spec_embed_verify_input_in_proxy(
+        self: Scheduler,
+        proxy_dict: Dict[str, torch.Tensor],
+        result: GenerationBatchResult,
+    ) -> None:
+        """Embed EagleVerifyInput fields and pending draft KV into the outgoing proxy
+        dict on PP-0 so that PP-N-1 can reconstruct batch.spec_info from them."""
+        vi = result.pp_spec_verify_input
+        if vi is None:
+            return
+        proxy_dict["spec_vi_draft_token"] = vi.draft_token
+        proxy_dict["spec_vi_custom_mask"] = vi.custom_mask
+        proxy_dict["spec_vi_positions"] = vi.positions
+        proxy_dict["spec_vi_retrive_index"] = vi.retrive_index
+        proxy_dict["spec_vi_retrive_next_token"] = vi.retrive_next_token
+        proxy_dict["spec_vi_retrive_next_sibling"] = vi.retrive_next_sibling
+        if vi.retrive_cum_len is not None:
+            proxy_dict["spec_vi_retrive_cum_len"] = vi.retrive_cum_len
+        proxy_dict["spec_vi_seq_lens_cpu"] = vi.seq_lens_cpu
+        # Pack Python scalars into a single int64 tensor for transport
+        proxy_dict["spec_vi_meta"] = torch.tensor(
+            [
+                vi.spec_steps,
+                vi.topk,
+                vi.draft_token_num,
+                vi.seq_lens_sum,
+                vi.num_tokens_per_req,
+                int(vi.capture_hidden_mode),
+            ],
+            dtype=torch.int64,
+            device="cpu",
+        )
+        if result.pp_draft_kv_slots is not None:
+            proxy_dict["spec_draft_kv_slots"] = result.pp_draft_kv_slots
+            proxy_dict["spec_draft_kv_data"] = result.pp_draft_kv_data
+
+    def _spec_extract_verify_input_from_proxy(
+        self: Scheduler,
+        pp_proxy_tensors,
+        batch: ScheduleBatch,
+    ) -> None:
+        """On PP-N-1: reconstruct EagleVerifyInput from the incoming proxy dict and
+        set it as batch.spec_info. No-op when the proxy carries no spec fields
+        (cold-start / normal DECODE steps)."""
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.speculative.eagle_info import EagleVerifyInput
+
+        d = pp_proxy_tensors.tensors
+        if "spec_vi_meta" not in d:
+            return
+        meta = d["spec_vi_meta"].tolist()
+        spec_steps, topk, draft_token_num, seq_lens_sum, num_tokens_per_req, chm_val = (
+            int(v) for v in meta
+        )
+        batch.spec_info = EagleVerifyInput(
+            draft_token=d["spec_vi_draft_token"],
+            custom_mask=d["spec_vi_custom_mask"],
+            positions=d["spec_vi_positions"],
+            retrive_index=d["spec_vi_retrive_index"],
+            retrive_next_token=d["spec_vi_retrive_next_token"],
+            retrive_next_sibling=d["spec_vi_retrive_next_sibling"],
+            retrive_cum_len=d.get("spec_vi_retrive_cum_len"),
+            seq_lens_cpu=d["spec_vi_seq_lens_cpu"],
+            spec_steps=spec_steps,
+            topk=topk,
+            draft_token_num=draft_token_num,
+            seq_lens_sum=seq_lens_sum,
+            num_tokens_per_req=num_tokens_per_req,
+            capture_hidden_mode=CaptureHiddenMode(chm_val),
+        )
+
     def _pp_prepare_tensor_dict(
         self: Scheduler, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> Dict[str, torch.Tensor]:
@@ -930,6 +1035,49 @@ class SchedulerPPMixin:
                 **tensor_dict,
                 **logprob_dict,
             }
+
+        # Spec decoding (PP disagg): embed EagleDraftInput tensors + KV transfer fields
+        # so PP-0 can reconstruct them after receiving via the output ring.
+        di = result.next_draft_input
+        if di is not None:
+            _none_safe = lambda t: t if t is not None else torch.empty(
+                0, dtype=torch.int64, device="cpu"
+            )
+            tensor_dict["spec_di_topk_p"] = di.topk_p
+            tensor_dict["spec_di_topk_index"] = di.topk_index
+            tensor_dict["spec_di_hidden_states"] = di.hidden_states
+            tensor_dict["spec_di_verified_id"] = di.verified_id
+            tensor_dict["spec_di_accept_length"] = di.accept_length
+            tensor_dict["spec_di_accept_length_cpu"] = torch.tensor(
+                di.accept_length_cpu or [], dtype=torch.int64
+            )
+            tensor_dict["spec_di_kv_indptr"] = _none_safe(di.kv_indptr)
+            tensor_dict["spec_di_kv_indices"] = _none_safe(di.kv_indices)
+            tensor_dict["spec_di_seq_lens_for_draft_extend"] = _none_safe(
+                di.seq_lens_for_draft_extend
+            )
+            tensor_dict["spec_di_seq_lens_for_draft_extend_cpu"] = _none_safe(
+                di.seq_lens_for_draft_extend_cpu
+            )
+            tensor_dict["spec_di_req_pool_indices_for_draft_extend"] = _none_safe(
+                di.req_pool_indices_for_draft_extend
+            )
+            tensor_dict["spec_di_meta"] = torch.tensor(
+                [
+                    di.num_tokens_per_req,
+                    di.num_tokens_for_logprob_per_req,
+                    int(di.capture_hidden_mode),
+                ],
+                dtype=torch.int64,
+            )
+        if result.spec_extend_kv_slots is not None:
+            tensor_dict["spec_extend_kv_slots"] = result.spec_extend_kv_slots
+            tensor_dict["spec_extend_kv_data"] = result.spec_extend_kv_data
+        if result.spec_accept_index is not None:
+            tensor_dict["spec_accept_index"] = result.spec_accept_index
+        if result.spec_evict_mask is not None:
+            tensor_dict["spec_evict_mask"] = result.spec_evict_mask
+
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -1040,12 +1188,79 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
         )
+
+        # Reconstruct EagleDraftInput from spec fields embedded in the output ring payload
+        d = pp_outputs.tensors
+        if "spec_di_meta" in d:
+            from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+            from sglang.srt.speculative.eagle_info import EagleDraftInput
+
+            meta = [int(v) for v in d["spec_di_meta"].tolist()]
+            num_tokens_per_req, num_tokens_for_logprob_per_req, chm_val = meta
+
+            accept_length_cpu_t = d.get("spec_di_accept_length_cpu")
+            accept_length_cpu = (
+                accept_length_cpu_t.tolist() if accept_length_cpu_t is not None else []
+            )
+
+            def _unwrap(key):
+                t = d.get(key)
+                return t if (t is not None and t.numel() > 0) else None
+
+            output_result.next_draft_input = EagleDraftInput(
+                topk_p=d["spec_di_topk_p"],
+                topk_index=d["spec_di_topk_index"],
+                hidden_states=d["spec_di_hidden_states"],
+                verified_id=d["spec_di_verified_id"],
+                accept_length=d["spec_di_accept_length"],
+                accept_length_cpu=accept_length_cpu,
+                kv_indptr=_unwrap("spec_di_kv_indptr"),
+                kv_indices=_unwrap("spec_di_kv_indices"),
+                seq_lens_for_draft_extend=_unwrap("spec_di_seq_lens_for_draft_extend"),
+                seq_lens_for_draft_extend_cpu=_unwrap(
+                    "spec_di_seq_lens_for_draft_extend_cpu"
+                ),
+                req_pool_indices_for_draft_extend=_unwrap(
+                    "spec_di_req_pool_indices_for_draft_extend"
+                ),
+                num_tokens_per_req=num_tokens_per_req,
+                num_tokens_for_logprob_per_req=num_tokens_for_logprob_per_req,
+                capture_hidden_mode=CaptureHiddenMode(chm_val),
+            )
+            output_result.spec_extend_kv_slots = d.get("spec_extend_kv_slots")
+            output_result.spec_extend_kv_data = d.get("spec_extend_kv_data")
+            output_result.spec_accept_index = d.get("spec_accept_index")
+            output_result.spec_evict_mask = d.get("spec_evict_mask")
+
         return output_result
 
     def _pp_process_batch_result(
-        self: Scheduler, batch: ScheduleBatch, output_result: GenerationBatchResult
+        self: Scheduler,
+        batch: ScheduleBatch,
+        output_result: GenerationBatchResult,
+        mb_id: Optional[int] = None,
     ):
         self.process_batch_result(batch, output_result)
+
+        # Spec decoding (PP disagg): after processing, run draft() on PP-0 using the
+        # EagleDraftInput received from PP-N-1 and store the resulting EagleVerifyInput
+        # so the next microbatch iteration can set batch.spec_info before launch.
+        if (
+            mb_id is not None
+            and self.pp_group.is_first_rank
+            and output_result.next_draft_input is not None
+            and getattr(self, "draft_worker", None) is not None
+        ):
+            from sglang.srt.speculative.standalone_worker import EaglePPFirstWorker
+
+            if isinstance(self.draft_worker, EaglePPFirstWorker):
+                next_verify_input = self.draft_worker.run_draft_after_recv(
+                    batch,
+                    output_result.next_draft_input,
+                    output_result.spec_extend_kv_slots,
+                    output_result.spec_extend_kv_data,
+                )
+                self._spec_verify_inputs[mb_id] = next_verify_input
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,

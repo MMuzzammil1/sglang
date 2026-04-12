@@ -7,8 +7,12 @@ from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
+from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
@@ -107,3 +111,334 @@ class StandaloneWorker(EAGLEWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+
+class EaglePPFirstWorker(StandaloneWorker):
+    """
+    Draft model worker for PP-0 in disagg-decode + speculative decoding mode.
+
+    Responsibilities:
+    - During VERIFY forward: run target layers only, embed EagleVerifyInput fields
+      and pending draft KV data into the result so the scheduler can include them in
+      the outgoing proxy dict for downstream ranks.
+    - After receiving EagleDraftInput + extend KV from PP-N-1 via the output ring:
+      mirror the extend KV into the local draft pool, then run draft() to produce the
+      next EagleVerifyInput (called by the scheduler in _pp_process_batch_result).
+    - Cold start DECODE: target DECODE only (PP-0 has no hidden states to extend draft);
+      draft() is triggered once PP-N-1 sends back EagleDraftInput via the ring.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._pending_draft_kv_slots: Optional[torch.Tensor] = None
+        self._pending_draft_kv_data: Optional[torch.Tensor] = None
+
+    # ------------------------------------------------------------------
+    # KV data helpers
+    # ------------------------------------------------------------------
+
+    def _get_draft_kv_data(self, slots: torch.Tensor) -> torch.Tensor:
+        """Read K+V tensors from the draft KV pool at the given slot indices.
+
+        Returns shape (num_layers, 2, num_slots, num_heads, head_dim).
+        """
+        kv_pool = self.draft_model_runner.token_to_kv_pool
+        k_data = torch.stack([buf[slots] for buf in kv_pool.k_buffer])
+        v_data = torch.stack([buf[slots] for buf in kv_pool.v_buffer])
+        return torch.stack([k_data, v_data], dim=1)
+
+    def _set_draft_kv_data(self, slots: torch.Tensor, kv_data: torch.Tensor):
+        """Write K+V tensors into the draft KV pool at the given slot indices.
+
+        kv_data must have shape (num_layers, 2, num_slots, num_heads, head_dim).
+        """
+        kv_pool = self.draft_model_runner.token_to_kv_pool
+        for layer_idx, (k_buf, v_buf) in enumerate(
+            zip(kv_pool.k_buffer, kv_pool.v_buffer)
+        ):
+            k_buf[slots] = kv_data[layer_idx, 0]
+            v_buf[slots] = kv_data[layer_idx, 1]
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def _forward_extend(
+        self, batch: ScheduleBatch, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        """Run target extend + draft extend, bootstrapping the draft KV pool.
+
+        pp_proxy_tensors is None on PP-0 (first rank); on PP-N-1 it carries hidden
+        states from the previous stage.
+        """
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+        )
+        logits_output = batch_result.logits_output
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.forward_draft_extend(
+                batch,
+                logits_output.hidden_states,
+                batch_result.next_token_ids,
+                model_worker_batch.seq_lens_cpu,
+            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=batch_result.next_token_ids,
+            num_accepted_tokens=0,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+        )
+
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors=None,
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            return self._forward_extend(batch, pp_proxy_tensors)
+
+        if isinstance(batch.spec_info, EagleVerifyInput):
+            return self._forward_verify_pp0(batch, pp_proxy_tensors)
+
+        # Cold start: no EagleVerifyInput yet — run plain target DECODE.
+        # draft() is triggered after PP-N-1 sends back EagleDraftInput via the ring.
+        return self._forward_decode_normal(batch, pp_proxy_tensors)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _forward_verify_pp0(
+        self, batch: ScheduleBatch, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        """Run target layers in VERIFY mode.
+
+        verify() runs on PP-N-1; draft() runs in run_draft_after_recv() below.
+        Attaches EagleVerifyInput and pending draft KV data to the result so the
+        scheduler can embed them in the outgoing proxy dict.
+        """
+        result = self.target_worker.forward_batch_generation(
+            batch.get_model_worker_batch(), pp_proxy_tensors=pp_proxy_tensors
+        )
+        result.pp_spec_verify_input = batch.spec_info
+        result.pp_draft_kv_slots = self._pending_draft_kv_slots
+        result.pp_draft_kv_data = self._pending_draft_kv_data
+        return result
+
+    def _forward_decode_normal(
+        self, batch: ScheduleBatch, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        """Cold start: plain target DECODE with no draft operations."""
+        return self.target_worker.forward_batch_generation(
+            batch.get_model_worker_batch(), pp_proxy_tensors=pp_proxy_tensors
+        )
+
+    def run_draft_after_recv(
+        self,
+        batch: ScheduleBatch,
+        eagle_draft_input: EagleDraftInput,
+        extend_kv_slots: Optional[torch.Tensor],
+        extend_kv_data: Optional[torch.Tensor],
+    ) -> EagleVerifyInput:
+        """Called by the scheduler after receiving EagleDraftInput + extend KV from
+        PP-N-1 via the output ring.
+
+        1. Mirror the extend KV entries into PP-0's draft KV pool.
+        2. Run draft() to produce an EagleVerifyInput for the next VERIFY pass.
+        3. Cache the resulting draft KV data to embed in the next proxy send.
+        """
+        if extend_kv_slots is not None and extend_kv_data is not None:
+            self._set_draft_kv_data(extend_kv_slots, extend_kv_data)
+
+        batch.spec_info = eagle_draft_input
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            next_verify_input = self.draft(batch)
+
+        draft_out_cache_loc = batch.out_cache_loc
+        self._pending_draft_kv_slots = draft_out_cache_loc
+        self._pending_draft_kv_data = self._get_draft_kv_data(draft_out_cache_loc)
+        return next_verify_input
+
+
+class EaglePPLastWorker(StandaloneWorker):
+    """
+    Draft model worker for PP-N-1 in disagg-decode + speculative decoding mode.
+
+    Responsibilities:
+    - VERIFY pass: write incoming draft KV from the proxy into the local draft pool,
+      run target layers in VERIFY mode, then call verify() + draft_extend_after_decode().
+    - Cold start DECODE: run target DECODE with CaptureHiddenMode.FULL, then call
+      forward_draft_extend() to bootstrap the draft model state.
+    - Never calls draft() — that is PP-0's responsibility.
+    - Returns EagleDraftInput + extend KV data + evict_mask + accept_index so the
+      scheduler can embed them in the output ring for PP-0 and intermediate ranks.
+    """
+
+    # ------------------------------------------------------------------
+    # KV data helpers
+    # ------------------------------------------------------------------
+
+    def _get_draft_kv_data(self, slots: torch.Tensor) -> torch.Tensor:
+        kv_pool = self.draft_model_runner.token_to_kv_pool
+        k_data = torch.stack([buf[slots] for buf in kv_pool.k_buffer])
+        v_data = torch.stack([buf[slots] for buf in kv_pool.v_buffer])
+        return torch.stack([k_data, v_data], dim=1)
+
+    def _set_draft_kv_data(self, slots: torch.Tensor, kv_data: torch.Tensor):
+        kv_pool = self.draft_model_runner.token_to_kv_pool
+        for layer_idx, (k_buf, v_buf) in enumerate(
+            zip(kv_pool.k_buffer, kv_pool.v_buffer)
+        ):
+            k_buf[slots] = kv_data[layer_idx, 0]
+            v_buf[slots] = kv_data[layer_idx, 1]
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def _forward_extend(
+        self, batch: ScheduleBatch, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        """Run target extend + draft extend on PP-N-1, bootstrapping the draft KV pool."""
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+        )
+        logits_output = batch_result.logits_output
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.forward_draft_extend(
+                batch,
+                logits_output.hidden_states,
+                batch_result.next_token_ids,
+                model_worker_batch.seq_lens_cpu,
+            )
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=batch_result.next_token_ids,
+            num_accepted_tokens=0,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+        )
+
+    def forward_batch_generation(
+        self,
+        batch: ScheduleBatch,
+        pp_proxy_tensors=None,
+    ) -> GenerationBatchResult:
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            return self._forward_extend(batch, pp_proxy_tensors)
+
+        if isinstance(batch.spec_info, EagleVerifyInput):
+            return self._forward_verify_pp_last(batch, pp_proxy_tensors)
+
+        # Cold start: EagleVerifyInput not yet produced — bootstrap draft state.
+        return self._forward_decode_cold_start(batch, pp_proxy_tensors)
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _forward_verify_pp_last(
+        self, batch: ScheduleBatch, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        """
+        1. Write incoming draft KV (from proxy) into local draft pool so that
+           draft_extend_after_decode() can attend over the correct history.
+        2. Run target layers in VERIFY mode.
+        3. Run verify() to accept/reject draft tokens.
+        4. Run draft_extend_after_decode() to update draft model state.
+        5. Collect extend KV data + evict/accept info for the output ring.
+        """
+        # 1. Mirror draft KV from PP-0 into local draft pool
+        if pp_proxy_tensors is not None:
+            kv_slots = pp_proxy_tensors.tensors.get("spec_draft_kv_slots")
+            kv_data = pp_proxy_tensors.tensors.get("spec_draft_kv_data")
+            if kv_slots is not None and kv_data is not None:
+                self._set_draft_kv_data(kv_slots, kv_data)
+
+        spec_info: EagleVerifyInput = batch.spec_info
+
+        # 2+3. Target VERIFY forward + verify()
+        logits_output, verify_output, _mwb, can_run_cuda_graph = self.verify(
+            batch, spec_info, pp_proxy_tensors
+        )
+        # batch.spec_info is now EagleDraftInput (set by verify())
+
+        # 4. Draft extend using accepted hidden states from batch.spec_info
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if (
+                self.server_args.enable_dp_attention
+                or batch.spec_info.verified_id.shape[0] > 0
+            ):
+                self.forward_draft_extend_after_decode(batch)
+
+        # 5. Collect extend KV for backward transfer to PP-0
+        extend_out_cache_loc = batch.out_cache_loc
+        extend_kv_data = self._get_draft_kv_data(extend_out_cache_loc)
+
+        accept_index = verify_output.accepted_indices
+        draft_len = spec_info.draft_token_num * len(batch.reqs)
+        evict_mask = torch.ones(draft_len, dtype=torch.bool, device=batch.device)
+        evict_mask[accept_index] = False
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=verify_output.verified_id,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            can_run_cuda_graph=can_run_cuda_graph,
+            next_draft_input=batch.spec_info,  # EagleDraftInput
+            spec_extend_kv_slots=extend_out_cache_loc,
+            spec_extend_kv_data=extend_kv_data,
+            spec_accept_index=accept_index,
+            spec_evict_mask=evict_mask,
+        )
+
+    def _forward_decode_cold_start(
+        self, batch: ScheduleBatch, pp_proxy_tensors
+    ) -> GenerationBatchResult:
+        """Cold start: target DECODE with full hidden-state capture, then
+        forward_draft_extend() to bootstrap the draft model state.
+        """
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, pp_proxy_tensors=pp_proxy_tensors
+        )
+        logits_output = batch_result.logits_output
+
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.forward_draft_extend(
+                batch,
+                logits_output.hidden_states,
+                batch_result.next_token_ids,
+                model_worker_batch.seq_lens_cpu,
+            )
+            # draft() is NOT called here; PP-0 will call it after receiving the
+            # EagleDraftInput via the output ring.
+
+        extend_out_cache_loc = batch.out_cache_loc
+        extend_kv_data = self._get_draft_kv_data(extend_out_cache_loc)
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=batch_result.next_token_ids,
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            next_draft_input=batch.spec_info,  # EagleDraftInput (cold start bootstrap)
+            spec_extend_kv_slots=extend_out_cache_loc,
+            spec_extend_kv_data=extend_kv_data,
+            spec_accept_index=None,
+            spec_evict_mask=None,
+        )
