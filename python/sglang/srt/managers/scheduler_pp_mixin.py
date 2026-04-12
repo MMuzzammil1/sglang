@@ -384,14 +384,6 @@ class SchedulerPPMixin:
                     if not self.cur_batch.forward_mode.is_prebuilt():
                         pp_proxy_tensors = self._pp_recv_proxy_tensors()
 
-                    # Spec+PP disagg: set batch.spec_info on PP-0 from cached verify input
-                    if (
-                        self.pp_group.is_first_rank
-                        and self._spec_verify_inputs[mb_id] is not None
-                    ):
-                        self.cur_batch.spec_info = self._spec_verify_inputs[mb_id]
-                        self._spec_verify_inputs[mb_id] = None
-
                     # Spec+PP disagg: on PP-N-1, reconstruct EagleVerifyInput from proxy
                     if (
                         self.pp_group.is_last_rank
@@ -565,10 +557,6 @@ class SchedulerPPMixin:
             defaultdict(deque)
         )
 
-        # Per-microbatch EagleVerifyInput produced by draft() on PP-0 in spec+PP disagg mode.
-        # PP-0 stores the next verify input here after run_draft_after_recv(); the loop
-        # picks it up on the following iteration and sets batch.spec_info before launch.
-        self._spec_verify_inputs: List[Optional[object]] = [None] * self.pp_loop_size
 
     def profile_and_init_predictor(self: Scheduler):
         """
@@ -1242,9 +1230,9 @@ class SchedulerPPMixin:
     ):
         self.process_batch_result(batch, output_result)
 
-        # Spec decoding (PP disagg): after processing, run draft() on PP-0 using the
-        # EagleDraftInput received from PP-N-1 and store the resulting EagleVerifyInput
-        # so the next microbatch iteration can set batch.spec_info before launch.
+        # Spec decoding (PP disagg): set batch.spec_info = EagleDraftInput on the
+        # running batch for this slot so that prepare_for_decode() sees it before the
+        # next forward. draft() itself runs inside forward_batch_generation().
         if (
             mb_id is not None
             and self.pp_group.is_first_rank
@@ -1254,13 +1242,14 @@ class SchedulerPPMixin:
             from sglang.srt.speculative.standalone_worker import EaglePPFirstWorker
 
             if isinstance(self.draft_worker, EaglePPFirstWorker):
-                next_verify_input = self.draft_worker.run_draft_after_recv(
-                    batch,
-                    output_result.next_draft_input,
-                    output_result.spec_extend_kv_slots,
-                    output_result.spec_extend_kv_data,
-                )
-                self._spec_verify_inputs[mb_id] = next_verify_input
+                running_batch = self.running_mbs[mb_id]
+                if running_batch is not None:
+                    self.draft_worker.recv_draft_input(
+                        running_batch,
+                        output_result.next_draft_input,
+                        output_result.spec_extend_kv_slots,
+                        output_result.spec_extend_kv_data,
+                    )
 
     def _pp_send_output_to_next_stage(
         self: Scheduler,

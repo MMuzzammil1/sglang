@@ -666,6 +666,9 @@ class Scheduler(
                 # Intermediate ranks run target-only; expose tp_worker as model_worker.
                 self.draft_worker = self.tp_worker
             self.external_corpus_manager = None
+            # Force spec_v1 path: prepare_for_decode() must not pre-allocate draft KV
+            # slots across the PP split (draft runs on PP-0, verify on PP-N-1).
+            self.enable_overlap = False
             return
 
         DraftWorkerClass = self.spec_algorithm.create_worker(self.server_args)
